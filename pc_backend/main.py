@@ -22,13 +22,16 @@ from PIL import Image
 import uvicorn
 
 # --- DPI Awareness ---
-try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
-except Exception: ctypes.windll.user32.SetProcessDPIAware()
+try:
+    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+except Exception:
+    try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception: ctypes.windll.user32.SetProcessDPIAware()
 
 # --- Windows API Setup --- (保持不变，省略展开以节省空间，直接用你原来的API声明即可)
 HANDLE = ctypes.c_size_t
 gdi32 = ctypes.windll.gdi32
-user32 = ctypes.windll.user32
+user32 = ctypes.WinDLL("user32", use_last_error=True)
 shell32 = ctypes.windll.shell32
 comctl32 = ctypes.windll.comctl32
 dwmapi = ctypes.windll.dwmapi
@@ -46,6 +49,8 @@ gdi32.SelectObject.argtypes = [HANDLE, HANDLE]
 gdi32.DeleteDC.argtypes = [HANDLE]
 user32.PrintWindow.argtypes = [HANDLE, HANDLE, wintypes.UINT]
 gdi32.StretchBlt.argtypes = [HANDLE, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, HANDLE, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
 
 # --- WGC Setup ---
 WGC_AVAILABLE = False
@@ -160,8 +165,148 @@ WGC_REQUESTED = False
 LIVE_MAX_DIM = 720.0
 LIVE_JPEG_QUALITY = 72
 LIVE_TARGET_FPS = 30.0
+GRID_PREVIEW_INTERVAL = 5.0
 current_obs_hwnd = 0
 connected_clients = set()
+
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+
+KEY_CODES = {
+    "BACKSPACE": win32con.VK_BACK, "TAB": win32con.VK_TAB, "ENTER": win32con.VK_RETURN,
+    "SHIFT": win32con.VK_SHIFT, "CTRL": win32con.VK_CONTROL, "CONTROL": win32con.VK_CONTROL,
+    "ALT": win32con.VK_MENU, "ESC": win32con.VK_ESCAPE, "ESCAPE": win32con.VK_ESCAPE,
+    "SPACE": win32con.VK_SPACE, "LEFT": win32con.VK_LEFT, "UP": win32con.VK_UP,
+    "RIGHT": win32con.VK_RIGHT, "DOWN": win32con.VK_DOWN, "DELETE": win32con.VK_DELETE,
+    "WIN": win32con.VK_LWIN, "META": win32con.VK_LWIN, "COPY": ord("C"), "PASTE": ord("V"),
+}
+for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+    KEY_CODES[c] = ord(c)
+for i in range(1, 13):
+    KEY_CODES[f"F{i}"] = win32con.VK_F1 + i - 1
+
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_WHEEL = 0x0800
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+PT_TOUCH = 2
+POINTER_FLAG_INRANGE = 0x00000002
+POINTER_FLAG_INCONTACT = 0x00000004
+POINTER_FLAG_PRIMARY = 0x00002000
+POINTER_FLAG_DOWN = 0x00010000
+POINTER_FLAG_UPDATE = 0x00020000
+POINTER_FLAG_UP = 0x00040000
+TOUCH_MASK_CONTACTAREA = 0x00000001
+TOUCH_MASK_ORIENTATION = 0x00000002
+TOUCH_MASK_PRESSURE = 0x00000004
+TOUCH_FLAG_NONE = 0x00000000
+TOUCH_FEEDBACK_DEFAULT = 0x1
+TOUCH_POINTER_ID = 0
+TOUCH_PRESSURE_NORMAL = 512
+INPUT_TOUCH_BUILD = "synthetic-touch-v3"
+touch_initialized = False
+synthetic_touch_device = None
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("union", INPUT_UNION)]
+
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
+
+class POINTER_INFO(ctypes.Structure):
+    _fields_ = [
+        ("pointerType", wintypes.DWORD),
+        ("pointerId", wintypes.UINT),
+        ("frameId", wintypes.UINT),
+        ("pointerFlags", wintypes.DWORD),
+        ("sourceDevice", HANDLE),
+        ("hwndTarget", HANDLE),
+        ("ptPixelLocation", wintypes.POINT),
+        ("ptHimetricLocation", wintypes.POINT),
+        ("ptPixelLocationRaw", wintypes.POINT),
+        ("ptHimetricLocationRaw", wintypes.POINT),
+        ("dwTime", wintypes.DWORD),
+        ("historyCount", wintypes.UINT),
+        ("InputData", ctypes.c_int),
+        ("dwKeyStates", wintypes.DWORD),
+        ("PerformanceCount", ctypes.c_uint64),
+        ("ButtonChangeType", ctypes.c_int),
+    ]
+
+class POINTER_TOUCH_INFO(ctypes.Structure):
+    _fields_ = [
+        ("pointerInfo", POINTER_INFO),
+        ("touchFlags", wintypes.DWORD),
+        ("touchMask", wintypes.DWORD),
+        ("rcContact", wintypes.RECT),
+        ("rcContactRaw", wintypes.RECT),
+        ("orientation", wintypes.UINT),
+        ("pressure", wintypes.UINT),
+    ]
+
+class POINTER_TYPE_UNION(ctypes.Union):
+    _fields_ = [
+        ("pointerInfo", POINTER_INFO),
+        ("touchInfo", POINTER_TOUCH_INFO),
+    ]
+
+class POINTER_TYPE_INFO(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("u", POINTER_TYPE_UNION),
+    ]
+
+if hasattr(user32, "InitializeTouchInjection"):
+    user32.InitializeTouchInjection.argtypes = [wintypes.UINT, wintypes.DWORD]
+    user32.InitializeTouchInjection.restype = wintypes.BOOL
+if hasattr(user32, "InjectTouchInput"):
+    user32.InjectTouchInput.argtypes = [wintypes.UINT, ctypes.POINTER(POINTER_TOUCH_INFO)]
+    user32.InjectTouchInput.restype = wintypes.BOOL
+if hasattr(user32, "CreateSyntheticPointerDevice"):
+    user32.CreateSyntheticPointerDevice.argtypes = [wintypes.DWORD, wintypes.ULONG, wintypes.DWORD]
+    user32.CreateSyntheticPointerDevice.restype = HANDLE
+if hasattr(user32, "InjectSyntheticPointerInput"):
+    user32.InjectSyntheticPointerInput.argtypes = [HANDLE, ctypes.POINTER(POINTER_TYPE_INFO), wintypes.UINT]
+    user32.InjectSyntheticPointerInput.restype = wintypes.BOOL
+if hasattr(user32, "DestroySyntheticPointerDevice"):
+    user32.DestroySyntheticPointerDevice.argtypes = [HANDLE]
+    user32.DestroySyntheticPointerDevice.restype = None
 
 # 线程池与退出信号 (处理 Graceful Shutdown)
 shutdown_event = threading.Event()
@@ -191,6 +336,275 @@ async def safe_close(websocket: WebSocket):
         try: await websocket.close()
         except: pass
 
+def get_window_screen_point(hwnd: int, x: float, y: float):
+    DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    rect = wintypes.RECT()
+    try:
+        dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
+    except Exception:
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        rect.left, rect.top, rect.right, rect.bottom = l, t, r, b
+    width = max(1, rect.right - rect.left)
+    height = max(1, rect.bottom - rect.top)
+    nx = max(0.0, min(float(x), 1.0))
+    ny = max(0.0, min(float(y), 1.0))
+    return int(rect.left + nx * width), int(rect.top + ny * height)
+
+def get_screens_list():
+    screens = []
+    try:
+        monitors = win32api.EnumDisplayMonitors()
+        primary_rect = (
+            user32.GetSystemMetrics(0),
+            user32.GetSystemMetrics(1),
+        )
+        for idx, monitor in enumerate(monitors, start=1):
+            handle, _, rect = monitor
+            info = win32api.GetMonitorInfo(handle)
+            left, top, right, bottom = info.get("Monitor", rect)
+            work = info.get("Work", (left, top, right, bottom))
+            is_primary = bool(info.get("Flags", 0) & 1)
+            screens.append({
+                "monitor_index": idx,
+                "name": info.get("Device", f"Monitor {idx}"),
+                "device": info.get("Device", f"Monitor {idx}"),
+                "left": int(left),
+                "top": int(top),
+                "right": int(right),
+                "bottom": int(bottom),
+                "width": int(right - left),
+                "height": int(bottom - top),
+                "is_primary": is_primary,
+                "work_left": int(work[0]),
+                "work_top": int(work[1]),
+                "work_right": int(work[2]),
+                "work_bottom": int(work[3]),
+            })
+    except Exception as e:
+        print(f"[screens] enumerate failed: {type(e).__name__}: {e}", flush=True)
+    return screens
+
+def get_screen_rect(monitor_index: int):
+    for screen in get_screens_list():
+        if int(screen["monitor_index"]) == int(monitor_index):
+            return screen
+    raise RuntimeError(f"screen not found: {monitor_index}")
+
+def get_screen_point(monitor_index: int, x: float, y: float):
+    screen = get_screen_rect(monitor_index)
+    nx = max(0.0, min(float(x), 1.0))
+    ny = max(0.0, min(float(y), 1.0))
+    sx = int(screen["left"] + nx * max(1, screen["width"]))
+    sy = int(screen["top"] + ny * max(1, screen["height"]))
+    return sx, sy
+
+def to_virtual_screen_point(sx: int, sy: int):
+    return sx - user32.GetSystemMetrics(SM_XVIRTUALSCREEN), sy - user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+
+def focus_window(hwnd: int, aggressive: bool = True):
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+        import win32process
+        current_thread = win32api.GetCurrentThreadId()
+        target_thread = win32process.GetWindowThreadProcessId(hwnd)[0]
+        foreground = win32gui.GetForegroundWindow()
+        foreground_thread = win32process.GetWindowThreadProcessId(foreground)[0] if foreground else 0
+        attached = []
+        for thread_id in {target_thread, foreground_thread}:
+            if thread_id and thread_id != current_thread:
+                try:
+                    user32.AttachThreadInput(current_thread, thread_id, True)
+                    attached.append(thread_id)
+                except Exception:
+                    pass
+        win32gui.BringWindowToTop(hwnd)
+        win32gui.SetForegroundWindow(hwnd)
+        try:
+            win32gui.SetFocus(hwnd)
+        except Exception:
+            pass
+        for thread_id in attached:
+            try:
+                user32.AttachThreadInput(current_thread, thread_id, False)
+            except Exception:
+                pass
+        if aggressive and win32gui.GetForegroundWindow() != hwnd:
+            # Fallback: Alt-based activation only when normal foreground activation fails.
+            for vk in (win32con.VK_MENU, win32con.VK_CONTROL, win32con.VK_SHIFT, win32con.VK_LWIN):
+                win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+            win32gui.SetForegroundWindow(hwnd)
+            win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.03)
+    except Exception:
+        pass
+
+def send_vk(vk: int, keyup: bool = False):
+    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP if keyup else 0, 0)
+    time.sleep(0.015)
+
+def send_key_name(name: str):
+    vk = KEY_CODES.get(str(name).upper())
+    if vk is None:
+        return False
+    send_vk(vk, False)
+    send_vk(vk, True)
+    return True
+
+def send_shortcut(keys):
+    vks = []
+    for key in keys or []:
+        vk = KEY_CODES.get(str(key).upper())
+        if vk is not None:
+            vks.append(vk)
+    for vk in vks:
+        send_vk(vk, False)
+    time.sleep(0.06)
+    for vk in reversed(vks):
+        send_vk(vk, True)
+    return bool(vks)
+
+def send_unicode_text(text: str):
+    for ch in text or "":
+        code = ord(ch)
+        if ch == "\n":
+            send_key_name("ENTER")
+            continue
+        inp_down = INPUT()
+        inp_down.type = INPUT_KEYBOARD
+        inp_down.union.ki = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
+        inp_up = INPUT()
+        inp_up.type = INPUT_KEYBOARD
+        inp_up.union.ki = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+        arr = (INPUT * 2)(inp_down, inp_up)
+        sent = user32.SendInput(2, arr, ctypes.sizeof(INPUT))
+        if sent != 2:
+            raise RuntimeError(f"SendInput unicode failed: sent={sent} error={ctypes.get_last_error()} size={ctypes.sizeof(INPUT)}")
+
+def handle_mouse_input(hwnd: int, data: dict):
+    action = data.get("action", "move")
+    sx, sy = get_window_screen_point(hwnd, data.get("x", 0.0), data.get("y", 0.0))
+    if action in ("down", "click"):
+        focus_window(hwnd, aggressive=True)
+    handle_mouse_at_point(sx, sy, data)
+
+def handle_mouse_at_point(sx: int, sy: int, data: dict):
+    action = data.get("action", "move")
+    user32.SetCursorPos(sx, sy)
+    button = data.get("button", "left")
+    if button == "right":
+        down_flag, up_flag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
+    elif button == "middle":
+        down_flag, up_flag = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
+    else:
+        down_flag, up_flag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
+    if action == "down":
+        user32.mouse_event(down_flag, 0, 0, 0, 0)
+    elif action == "up":
+        user32.mouse_event(up_flag, 0, 0, 0, 0)
+    elif action == "click":
+        user32.mouse_event(down_flag, 0, 0, 0, 0)
+        user32.mouse_event(up_flag, 0, 0, 0, 0)
+    elif action == "wheel":
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, int(data.get("delta", 0)), 0)
+
+def handle_mouse_screen_input(monitor_index: int, data: dict):
+    sx, sy = get_screen_point(monitor_index, data.get("x", 0.5), data.get("y", 0.5))
+    handle_mouse_at_point(sx, sy, data)
+
+def build_touch_info(hwnd: int, data: dict):
+    action = data.get("action", "move")
+    sx, sy = get_window_screen_point(hwnd, data.get("x", 0.0), data.get("y", 0.0))
+    return build_touch_info_at_point(action, sx, sy)
+
+def build_screen_touch_info(monitor_index: int, data: dict):
+    action = data.get("action", "move")
+    sx, sy = get_screen_point(monitor_index, data.get("x", 0.0), data.get("y", 0.0))
+    return build_touch_info_at_point(action, sx, sy)
+
+def build_touch_info_at_point(action: str, sx: int, sy: int):
+    tx, ty = to_virtual_screen_point(sx, sy)
+
+    if action == "down":
+        flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN
+    elif action == "up":
+        flags = POINTER_FLAG_UP
+    else:
+        flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE
+
+    contact_size = 4
+    touch = POINTER_TOUCH_INFO()
+    touch.pointerInfo.pointerType = PT_TOUCH
+    touch.pointerInfo.pointerId = TOUCH_POINTER_ID
+    touch.pointerInfo.pointerFlags = flags
+    touch.pointerInfo.historyCount = 1
+    touch.pointerInfo.ptPixelLocation = wintypes.POINT(tx, ty)
+    touch.pointerInfo.ptPixelLocationRaw = wintypes.POINT(tx, ty)
+    touch.touchFlags = TOUCH_FLAG_NONE
+    if action == "up":
+        touch.touchMask = 0
+    else:
+        touch.touchMask = TOUCH_MASK_CONTACTAREA
+        touch.rcContact = wintypes.RECT(tx - contact_size, ty - contact_size, tx + contact_size, ty + contact_size)
+    return action, sx, sy, tx, ty, flags, touch
+
+def inject_synthetic_touch(action: str, sx: int, sy: int, tx: int, ty: int, flags: int, touch: POINTER_TOUCH_INFO):
+    global synthetic_touch_device
+    if not hasattr(user32, "CreateSyntheticPointerDevice") or not hasattr(user32, "InjectSyntheticPointerInput"):
+        raise RuntimeError("Windows synthetic pointer API is unavailable")
+    if not synthetic_touch_device:
+        synthetic_touch_device = user32.CreateSyntheticPointerDevice(PT_TOUCH, 1, TOUCH_FEEDBACK_DEFAULT)
+        if not synthetic_touch_device:
+            raise RuntimeError(f"CreateSyntheticPointerDevice failed: {ctypes.get_last_error()}")
+
+    pointer_type_info = POINTER_TYPE_INFO()
+    pointer_type_info.type = PT_TOUCH
+    pointer_type_info.u.touchInfo = touch
+    if not user32.InjectSyntheticPointerInput(synthetic_touch_device, ctypes.byref(pointer_type_info), 1):
+        raise RuntimeError(
+            f"InjectSyntheticPointerInput failed: {ctypes.get_last_error()} "
+            f"action={action} flags=0x{flags:x} screen=({sx},{sy}) virtual=({tx},{ty}) "
+            f"mask=0x{touch.touchMask:x} touchSize={ctypes.sizeof(POINTER_TOUCH_INFO)} "
+            f"typeSize={ctypes.sizeof(POINTER_TYPE_INFO)} build={INPUT_TOUCH_BUILD}"
+        )
+
+def inject_legacy_touch(action: str, sx: int, sy: int, flags: int, touch: POINTER_TOUCH_INFO):
+    global touch_initialized
+    if not hasattr(user32, "InitializeTouchInjection") or not hasattr(user32, "InjectTouchInput"):
+        raise RuntimeError("Windows touch injection API is unavailable")
+    if not touch_initialized:
+        if not user32.InitializeTouchInjection(1, TOUCH_FEEDBACK_DEFAULT):
+            raise RuntimeError(f"InitializeTouchInjection failed: {ctypes.get_last_error()}")
+        touch_initialized = True
+
+    if not user32.InjectTouchInput(1, ctypes.byref(touch)):
+        raise RuntimeError(
+            f"InjectTouchInput failed: {ctypes.get_last_error()} "
+            f"action={action} flags=0x{flags:x} point=({sx},{sy}) "
+            f"mask=0x{touch.touchMask:x} size={ctypes.sizeof(POINTER_TOUCH_INFO)} "
+            f"build={INPUT_TOUCH_BUILD}"
+        )
+
+def handle_touch_input(hwnd: int, data: dict):
+    action = data.get("action", "move")
+    if action == "down":
+        focus_window(hwnd, aggressive=True)
+
+    action, sx, sy, tx, ty, flags, touch = build_touch_info(hwnd, data)
+    if hasattr(user32, "CreateSyntheticPointerDevice") and hasattr(user32, "InjectSyntheticPointerInput"):
+        inject_synthetic_touch(action, sx, sy, tx, ty, flags, touch)
+    else:
+        inject_legacy_touch(action, sx, sy, flags, touch)
+
+def handle_touch_screen_input(monitor_index: int, data: dict):
+    action, sx, sy, tx, ty, flags, touch = build_screen_touch_info(monitor_index, data)
+    if hasattr(user32, "CreateSyntheticPointerDevice") and hasattr(user32, "InjectSyntheticPointerInput"):
+        inject_synthetic_touch(action, sx, sy, tx, ty, flags, touch)
+    else:
+        inject_legacy_touch(action, sx, sy, flags, touch)
+
 @app.post("/switch/{hwnd}")
 async def switch_window(hwnd: int, request: Request):
     if request.headers.get("password") != PASSWORD: return JSONResponse(status_code=401, content={"message": "Invalid password"})
@@ -199,10 +613,10 @@ async def switch_window(hwnd: int, request: Request):
     return {"status": "success"}
 
 @app.post("/config/wgc")
-async def set_wgc(enabled: bool, max_dim: int = 720, quality: int = 72, fps: int = 30):
+async def set_wgc(enabled: bool = True, max_dim: int = 720, quality: int = 72, fps: int = 30):
     global USE_WGC, WGC_REQUESTED, LIVE_MAX_DIM, LIVE_JPEG_QUALITY, LIVE_TARGET_FPS
-    WGC_REQUESTED = enabled
-    USE_WGC = enabled and WGC_AVAILABLE
+    WGC_REQUESTED = True
+    USE_WGC = WGC_AVAILABLE
     LIVE_MAX_DIM = float(max(360, min(max_dim, 1440)))
     LIVE_JPEG_QUALITY = max(35, min(quality, 95))
     LIVE_TARGET_FPS = float(max(5, min(fps, 60)))
@@ -213,6 +627,98 @@ async def set_wgc(enabled: bool, max_dim: int = 720, quality: int = 72, fps: int
         "quality": LIVE_JPEG_QUALITY,
         "fps": int(LIVE_TARGET_FPS)
     }
+
+@app.post("/config/grid_preview")
+async def set_grid_preview(interval_ms: int = 2000):
+    global GRID_PREVIEW_INTERVAL
+    GRID_PREVIEW_INTERVAL = max(0.5, min(float(interval_ms) / 1000.0, 10.0))
+    return {"interval_ms": int(GRID_PREVIEW_INTERVAL * 1000)}
+
+@app.get("/screens")
+async def screens_endpoint():
+    return get_screens_list()
+
+@app.websocket("/input/{hwnd}")
+async def input_endpoint(websocket: WebSocket, hwnd: int):
+    await websocket.accept()
+    try:
+        if await websocket.receive_text() != PASSWORD:
+            await websocket.send_text(json.dumps({"type": "error", "message": "auth failed"}))
+            await safe_close(websocket)
+            return
+        print(f"[input] connected hwnd={hwnd} title={win32gui.GetWindowText(hwnd)!r} build={INPUT_TOUCH_BUILD}", flush=True)
+        await websocket.send_text(json.dumps({"type": "status", "message": f"input connected {INPUT_TOUCH_BUILD}"}))
+
+        while not shutdown_event.is_set():
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+                event_type = data.get("type")
+                if event_type == "mouse":
+                    handle_mouse_input(hwnd, data)
+                elif event_type == "touch":
+                    handle_touch_input(hwnd, data)
+                elif event_type == "text":
+                    text = data.get("text", "")
+                    print(f"[input] text hwnd={hwnd} chars={len(text)} text={text!r}", flush=True)
+                    focus_window(hwnd, aggressive=True)
+                    send_unicode_text(text)
+                elif event_type == "key":
+                    print(f"[input] key hwnd={hwnd} key={data.get('key', '')!r}", flush=True)
+                    focus_window(hwnd, aggressive=True)
+                    send_key_name(data.get("key", ""))
+                elif event_type == "shortcut":
+                    print(f"[input] shortcut hwnd={hwnd} keys={data.get('keys', [])!r}", flush=True)
+                    focus_window(hwnd, aggressive=True)
+                    send_shortcut(data.get("keys", []))
+                else:
+                    await websocket.send_text(json.dumps({"type": "error", "message": f"unknown input type: {event_type}"}))
+            except Exception as e:
+                await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[input] failed hwnd={hwnd}: {type(e).__name__}: {e}", flush=True)
+    finally:
+        await safe_close(websocket)
+
+@app.websocket("/input/screen/{monitor_index}")
+async def input_screen_endpoint(websocket: WebSocket, monitor_index: int):
+    await websocket.accept()
+    try:
+        if await websocket.receive_text() != PASSWORD:
+            await websocket.send_text(json.dumps({"type": "error", "message": "auth failed"}))
+            await safe_close(websocket)
+            return
+        screen = get_screen_rect(monitor_index)
+        print(f"[input] connected screen={monitor_index} rect={screen}", flush=True)
+        await websocket.send_text(json.dumps({"type": "status", "message": f"screen input connected {monitor_index}"}))
+
+        while not shutdown_event.is_set():
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+                event_type = data.get("type")
+                if event_type == "mouse":
+                    handle_mouse_screen_input(monitor_index, data)
+                elif event_type == "touch":
+                    handle_touch_screen_input(monitor_index, data)
+                elif event_type == "text":
+                    send_unicode_text(data.get("text", ""))
+                elif event_type == "key":
+                    send_key_name(data.get("key", ""))
+                elif event_type == "shortcut":
+                    send_shortcut(data.get("keys", []))
+                else:
+                    await websocket.send_text(json.dumps({"type": "error", "message": f"unknown input type: {event_type}"}))
+            except Exception as e:
+                await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[input] screen failed monitor={monitor_index}: {type(e).__name__}: {e}", flush=True)
+    finally:
+        await safe_close(websocket)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -234,7 +740,6 @@ async def websocket_endpoint(websocket: WebSocket):
 async def live_stream_endpoint(
     websocket: WebSocket,
     hwnd: int,
-    use_wgc: bool | None = None,
     max_dim: int | None = None,
     quality: int | None = None,
     fps: int | None = None
@@ -243,110 +748,93 @@ async def live_stream_endpoint(
     capture = None
     capture_control = None
     try:
-        stream_use_wgc = WGC_REQUESTED if use_wgc is None else use_wgc
+        stream_use_wgc = True
         stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 1440)))
         stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 95))
         stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 60)))
 
-        if stream_use_wgc:
-            if not WGC_AVAILABLE:
-                print(f"[live] hwnd={hwnd} requested WGC but windows_capture is unavailable", flush=True)
-                await safe_close(websocket)
-                return
+        if not WGC_AVAILABLE:
+            print(f"[live] hwnd={hwnd} requested WGC but windows_capture is unavailable", flush=True)
+            await safe_close(websocket)
+            return
 
-            title = win32gui.GetWindowText(hwnd)
-            print(
-                f"[live] start WGC hwnd={hwnd} title={title!r} max_dim={stream_max_dim:.0f} "
-                f"quality={stream_quality} fps={stream_fps:.0f}",
-                flush=True
-            )
-            capture = WindowsCapture(window_name=title, draw_border=False)
-            wgc_buffer = collections.deque(maxlen=1)
-            last_accepted_frame = 0.0
-            received_frames = 0
-            sent_frames = 0
-            last_log_at = time.perf_counter()
+        title = win32gui.GetWindowText(hwnd)
+        print(
+            f"[live] start WGC hwnd={hwnd} title={title!r} max_dim={stream_max_dim:.0f} "
+            f"quality={stream_quality} fps={stream_fps:.0f}",
+            flush=True
+        )
+        capture = WindowsCapture(window_name=title, draw_border=False)
+        wgc_buffer = collections.deque(maxlen=1)
+        last_accepted_frame = 0.0
+        received_frames = 0
+        sent_frames = 0
+        last_log_at = time.perf_counter()
+        
+        loop = asyncio.get_running_loop()
+        frame_event = asyncio.Event()
+
+        @capture.event
+        def on_frame_arrived(frame: Frame, _):
+            nonlocal last_accepted_frame, received_frames
+            try:
+                now = time.perf_counter()
+                min_frame_interval = 1.0 / max(stream_fps, 1.0)
+                if now - last_accepted_frame < min_frame_interval:
+                    return
+                last_accepted_frame = now
+                received_frames += 1
+                if received_frames == 1:
+                    print(f"[live] first WGC frame arrived hwnd={hwnd}", flush=True)
+                wgc_buffer.append(frame.convert_to_bgr().frame_buffer.copy())
+                loop.call_soon_threadsafe(frame_event.set)
+            except Exception as e:
+                print(f"[live] WGC frame callback failed hwnd={hwnd}: {type(e).__name__}: {e}", flush=True)
+
+        @capture.event
+        def on_closed(*_):
+            print(f"[live] WGC closed hwnd={hwnd}", flush=True)
+            try:
+                loop.call_soon_threadsafe(frame_event.set)
+            except Exception:
+                pass
+
+        capture_control = capture.start_free_threaded()
+
+        def process_wgc_frame(img_array):
+            h, w = img_array.shape[:2]
+            if w > stream_max_dim or h > stream_max_dim:
+                scale = min(stream_max_dim/w, stream_max_dim/h)
+                new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+                img_s = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                img_s = img_array
+            ok, buf = cv2.imencode('.jpg', img_s, [int(cv2.IMWRITE_JPEG_QUALITY), stream_quality])
+            return buf.tobytes() if ok else b""
             
-            loop = asyncio.get_running_loop()
-            frame_event = asyncio.Event()
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(frame_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            frame_event.clear()
 
-            @capture.event
-            def on_frame_arrived(frame: Frame, _):
-                nonlocal last_accepted_frame, received_frames
+            if capture_control and capture_control.is_finished() and not wgc_buffer:
+                break
+            if wgc_buffer:
+                img = wgc_buffer.pop()
                 try:
-                    now = time.perf_counter()
-                    min_frame_interval = 1.0 / max(stream_fps, 1.0)
-                    if now - last_accepted_frame < min_frame_interval:
-                        return
-                    last_accepted_frame = now
-                    received_frames += 1
-                    if received_frames == 1:
-                        print(f"[live] first WGC frame arrived hwnd={hwnd}", flush=True)
-                    wgc_buffer.append(frame.convert_to_bgr().frame_buffer.copy())
-                    loop.call_soon_threadsafe(frame_event.set)
-                except Exception as e:
-                    print(f"[live] WGC frame callback failed hwnd={hwnd}: {type(e).__name__}: {e}", flush=True)
-
-            @capture.event
-            def on_closed(*_):
-                print(f"[live] WGC closed hwnd={hwnd}", flush=True)
-                try:
-                    loop.call_soon_threadsafe(frame_event.set)
+                    jpg_bytes = await loop.run_in_executor(live_stream_pool, process_wgc_frame, img)
+                    if jpg_bytes:
+                        await websocket.send_bytes(jpg_bytes)
+                        sent_frames += 1
+                        now = time.perf_counter()
+                        if sent_frames == 1 or now - last_log_at >= 3.0:
+                            last_log_at = now
+                            print(f"[live] sent WGC frame hwnd={hwnd} count={sent_frames} bytes={len(jpg_bytes)}", flush=True)
                 except Exception:
-                    pass
-
-            capture_control = capture.start_free_threaded()
-
-            def process_wgc_frame(img_array):
-                h, w = img_array.shape[:2]
-                # 如果画面很大才需要缩放，小窗口直接发，大幅节约 CPU 算力
-                if w > stream_max_dim or h > stream_max_dim:
-                    scale = min(stream_max_dim/w, stream_max_dim/h)
-                    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
-                    img_s = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                else:
-                    img_s = img_array
-                    
-                ok, buf = cv2.imencode('.jpg', img_s, [int(cv2.IMWRITE_JPEG_QUALITY), stream_quality])
-                return buf.tobytes() if ok else b""
-            
-            while not shutdown_event.is_set():
-                try:
-                    await asyncio.wait_for(frame_event.wait(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    continue
-                
-                frame_event.clear()
-
-                if capture_control and capture_control.is_finished() and not wgc_buffer:
+                    print(f"[live] send WGC frame failed hwnd={hwnd}", flush=True)
                     break
-                
-                if wgc_buffer:
-                    img = wgc_buffer.pop()
-                    
-                    try:
-                        jpg_bytes = await loop.run_in_executor(live_stream_pool, process_wgc_frame, img)
-                        if jpg_bytes:
-                            await websocket.send_bytes(jpg_bytes)
-                            sent_frames += 1
-                            now = time.perf_counter()
-                            if sent_frames == 1 or now - last_log_at >= 3.0:
-                                last_log_at = now
-                                print(
-                                    f"[live] sent WGC frame hwnd={hwnd} count={sent_frames} bytes={len(jpg_bytes)}",
-                                    flush=True
-                                )
-                        
-                        # send_bytes 会随网络背压阻塞；队列只保留最新帧，避免延迟越积越大。
-                    except Exception:
-                        print(f"[live] send WGC frame failed hwnd={hwnd}", flush=True)
-                        break
-        else:
-            print(f"[live] start GDI hwnd={hwnd}", flush=True)
-            while not shutdown_event.is_set():
-                p = await asyncio.to_thread(get_window_preview_gdi, hwnd, 65, 800, 600)
-                if p: await websocket.send_bytes(base64.b64decode(p))
-                await asyncio.sleep(0.04)
                 
     except asyncio.CancelledError:
         # 【修复3】：安静地接受 FastAPI 的退出信号，直接结束协程
@@ -359,6 +847,78 @@ async def live_stream_endpoint(
             try: 
                 capture_control.stop()
             except Exception: 
+                pass
+        await safe_close(websocket)
+
+@app.websocket("/live/screen/{monitor_index}")
+async def live_screen_stream_endpoint(
+    websocket: WebSocket,
+    monitor_index: int,
+    max_dim: int | None = None,
+    quality: int | None = None,
+    fps: int | None = None
+):
+    await websocket.accept()
+    capture = None
+    capture_control = None
+    try:
+        if not WGC_AVAILABLE:
+            await safe_close(websocket)
+            return
+        _ = get_screen_rect(monitor_index)
+        stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 2160)))
+        stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 95))
+        stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 60)))
+        print(f"[live] start WGC screen={monitor_index} max_dim={stream_max_dim:.0f} quality={stream_quality} fps={stream_fps:.0f}", flush=True)
+        capture = WindowsCapture(monitor_index=monitor_index, draw_border=False)
+        wgc_buffer = collections.deque(maxlen=1)
+        last_accepted_frame = 0.0
+        loop = asyncio.get_running_loop()
+        frame_event = asyncio.Event()
+
+        @capture.event
+        def on_frame_arrived(frame: Frame, _):
+            nonlocal last_accepted_frame
+            now = time.perf_counter()
+            if now - last_accepted_frame < (1.0 / max(stream_fps, 1.0)):
+                return
+            last_accepted_frame = now
+            wgc_buffer.append(frame.convert_to_bgr().frame_buffer.copy())
+            loop.call_soon_threadsafe(frame_event.set)
+
+        @capture.event
+        def on_closed(*_):
+            loop.call_soon_threadsafe(frame_event.set)
+
+        capture_control = capture.start_free_threaded()
+
+        def process_wgc_frame(img_array):
+            h, w = img_array.shape[:2]
+            if w > stream_max_dim or h > stream_max_dim:
+                scale = min(stream_max_dim / w, stream_max_dim / h)
+                img_array = cv2.resize(img_array, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode('.jpg', img_array, [int(cv2.IMWRITE_JPEG_QUALITY), stream_quality])
+            return buf.tobytes() if ok else b""
+
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(frame_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            frame_event.clear()
+            if capture_control and capture_control.is_finished() and not wgc_buffer:
+                break
+            if wgc_buffer:
+                jpg_bytes = await loop.run_in_executor(live_stream_pool, process_wgc_frame, wgc_buffer.pop())
+                if jpg_bytes:
+                    await websocket.send_bytes(jpg_bytes)
+    except Exception as e:
+        print(f"[live] screen stream failed monitor={monitor_index}: {type(e).__name__}: {e}", flush=True)
+    finally:
+        if capture_control:
+            try:
+                capture_control.stop()
+            except Exception:
                 pass
         await safe_close(websocket)
 
@@ -393,9 +953,9 @@ async def grid_preview_broadcaster():
                 if previews:
                     msg = json.dumps({"type": "grid_previews", "data": previews})
                     for ws in list(connected_clients): await ws.send_text(msg)
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(GRID_PREVIEW_INTERVAL)
         except asyncio.CancelledError: break # 关键修复！
-        except Exception: await asyncio.sleep(5.0)
+        except Exception: await asyncio.sleep(GRID_PREVIEW_INTERVAL)
 
 def udp_discovery():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

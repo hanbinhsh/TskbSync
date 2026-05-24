@@ -34,6 +34,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val discovered = viewModel.discoveredServers
     val gridCols by viewModel.gridColumns
     val showTitles by viewModel.showTitles
+    val shortcuts by viewModel.shortcuts
     
     var tempIp by remember { mutableStateOf(pcIp) }
     var tempPass by remember { mutableStateOf(password) }
@@ -44,6 +45,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     
     var colorPickerMode by remember { mutableStateOf("accent") } 
     var showColorDialog by remember { mutableStateOf(false) }
+    var editingShortcutIndex by remember { mutableStateOf<Int?>(null) }
     
     val themeColor = Color(theme.color)
     val titleColor = Color(theme.titleColor)
@@ -71,7 +73,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
             }
         ) { padding ->
             var selectedTab by remember { mutableIntStateOf(0) }
-            val tabs = listOf("连接", "显示", "外观")
+            val tabs = listOf("连接", "显示", "外观", "快捷键")
 
             Column(modifier = Modifier.fillMaxSize().padding(padding)) {
                 TabRow(selectedTabIndex = selectedTab) {
@@ -166,8 +168,14 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         Switch(checked = theme.showPreviews, onCheckedChange = { viewModel.updateTheme(theme.copy(showPreviews = it)) })
                                     }
                                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("Use Windows Graphics Capture", modifier = Modifier.weight(1f))
-                                        Switch(checked = theme.useWgc, onCheckedChange = { viewModel.updateTheme(theme.copy(useWgc = it)) })
+                                        Text("Clip Large Preview Corners", modifier = Modifier.weight(1f))
+                                        Switch(
+                                            checked = theme.clipLivePreview,
+                                            onCheckedChange = { viewModel.updateTheme(theme.copy(clipLivePreview = it)) }
+                                        )
+                                    }
+                                    StreamSlider("Large Preview Corner", theme.livePreviewCornerPx, " px", 0f..64f, 15) {
+                                        viewModel.updateTheme(theme.copy(livePreviewCornerPx = it))
                                     }
                                     HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                                     StreamSlider("Stream Resolution", theme.streamMaxDim, "p", 360f..1440f, 8) {
@@ -178,6 +186,9 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     }
                                     StreamSlider("Stream FPS", theme.streamFps, " fps", 5f..60f, 10) {
                                         viewModel.updateTheme(theme.copy(streamFps = it))
+                                    }
+                                    StreamSlider("Grid Refresh", theme.gridPreviewIntervalMs, " ms", 500f..3000f, 24) {
+                                        viewModel.updateTheme(theme.copy(gridPreviewIntervalMs = it))
                                     }
                                 }
                             }
@@ -218,13 +229,66 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     )
                                     if (theme.bgImagePath.isNotEmpty()) {
                                         Column(Modifier.padding(16.dp)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                                Text("Show Wallpaper", modifier = Modifier.weight(1f))
+                                                Switch(
+                                                    checked = theme.showWallpaper,
+                                                    onCheckedChange = { viewModel.updateTheme(theme.copy(showWallpaper = it)) }
+                                                )
+                                            }
                                             OpacitySlider("Wallpaper Opacity", tempBgAlpha) {
                                                 tempBgAlpha = it
                                                 viewModel.updateTheme(theme.copy(bgAlpha = it))
                                             }
-                                            TextButton(onClick = { viewModel.updateTheme(theme.copy(bgImagePath = "")) }) {
-                                                Text("Remove Wallpaper", color = MaterialTheme.colorScheme.error)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        3 -> item {
+                            SectionTitle("Shortcuts", themeColor)
+                            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                                Column {
+                                    shortcuts.forEachIndexed { index, shortcut ->
+                                        ListItem(
+                                            headlineContent = { Text(shortcut.label) },
+                                            supportingContent = { Text(shortcut.keys.joinToString(" + ")) },
+                                            leadingContent = { Icon(Icons.Default.KeyboardCommandKey, null) },
+                                            trailingContent = {
+                                                Row {
+                                                    IconButton(onClick = { editingShortcutIndex = index }) {
+                                                        Icon(Icons.Default.Edit, null)
+                                                    }
+                                                    IconButton(onClick = {
+                                                        viewModel.saveShortcuts(shortcuts.filterIndexed { i, _ -> i != index })
+                                                    }) {
+                                                        Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
+                                                    }
+                                                }
                                             }
+                                        )
+                                    }
+                                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                    ) {
+                                        OutlinedButton(
+                                            onClick = { editingShortcutIndex = shortcuts.size },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Icon(Icons.Default.Add, null)
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Add")
+                                        }
+                                        Button(
+                                            onClick = { viewModel.restoreDefaultShortcuts() },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Icon(Icons.Default.Restore, null)
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Defaults")
                                         }
                                     }
                                 }
@@ -263,6 +327,20 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                 }
                 viewModel.updateTheme(newTheme)
                 showColorDialog = false
+            }
+        )
+    }
+
+    editingShortcutIndex?.let { index ->
+        val existing = shortcuts.getOrNull(index)
+        ShortcutEditDialog(
+            shortcut = existing,
+            onDismiss = { editingShortcutIndex = null },
+            onSave = { shortcut ->
+                val next = shortcuts.toMutableList()
+                if (index in next.indices) next[index] = shortcut else next.add(shortcut)
+                viewModel.saveShortcuts(next)
+                editingShortcutIndex = null
             }
         )
     }
@@ -305,6 +383,52 @@ fun StreamSlider(
             steps = steps
         )
     }
+}
+
+@Composable
+fun ShortcutEditDialog(
+    shortcut: ShortcutConfig?,
+    onDismiss: () -> Unit,
+    onSave: (ShortcutConfig) -> Unit
+) {
+    var label by remember(shortcut) { mutableStateOf(shortcut?.label ?: "") }
+    var keysText by remember(shortcut) { mutableStateOf(shortcut?.keys?.joinToString("+") ?: "") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (shortcut == null) "Add Shortcut" else "Edit Shortcut") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = label,
+                    onValueChange = { label = it },
+                    label = { Text("Label") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = keysText,
+                    onValueChange = { keysText = it.uppercase() },
+                    label = { Text("Keys, e.g. CTRL+V") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val keys = keysText.split("+", ",", " ")
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                    if (label.isNotBlank() && keys.isNotEmpty()) {
+                        onSave(ShortcutConfig(label.trim(), keys))
+                    }
+                }
+            ) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @OptIn(ExperimentalLayoutApi::class)

@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.ktor.client.*
+import io.ktor.client.call.body
 import io.ktor.client.plugins.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.websocket.*
@@ -31,9 +32,12 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val settingsManager = SettingsManager(application)
     private var connectionJob: Job? = null
     private var liveStreamJob: Job? = null
+    private var inputJob: Job? = null
 
     private val client = HttpClient {
-        install(ContentNegotiation) { json() }
+        install(ContentNegotiation) {
+            json(Json { ignoreUnknownKeys = true })
+        }
         install(WebSockets) {
             contentConverter = KotlinxWebsocketSerializationConverter(Json)
             pingIntervalMillis = 10000
@@ -56,7 +60,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _password = mutableStateOf("")
     val password: State<String> = _password
 
-    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, false, 720, 72, 30))
+    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, 2000, false, 18))
     val theme: State<ThemeSettings> = _theme
 
     private val _layoutMode = mutableStateOf("grid")
@@ -78,7 +82,18 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _selectedRowHwnd = mutableStateOf<Long?>(null)
     val selectedRowHwnd: State<Long?> = _selectedRowHwnd
 
+    private val _shortcuts = mutableStateOf(defaultShortcutConfigs)
+    val shortcuts: State<List<ShortcutConfig>> = _shortcuts
+
+    private val _inputStatus = mutableStateOf<String?>(null)
+    val inputStatus: State<String?> = _inputStatus
+
+    private var inputWsSession: DefaultClientWebSocketSession? = null
+    private var remoteInputTarget: String? = null
+
     val gridPreviewCache = mutableStateMapOf<Long, String>()
+    private val _screens = mutableStateOf<List<ScreenInfo>>(emptyList())
+    val screens: State<List<ScreenInfo>> = _screens
 
     private var activeWsSession: DefaultClientWebSocketSession? = null
     val discoveredServers = mutableStateListOf<String>()
@@ -91,6 +106,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { settingsManager.layoutMode.collectLatest { _layoutMode.value = it } }
         viewModelScope.launch { settingsManager.gridColumns.collectLatest { _gridColumns.value = it } }
         viewModelScope.launch { settingsManager.showTitles.collectLatest { _showTitles.value = it } }
+        viewModelScope.launch { settingsManager.shortcuts.collectLatest { _shortcuts.value = it } }
 
         viewModelScope.launch {
             delay(1500)
@@ -105,6 +121,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         connectionJob = viewModelScope.launch {
             try {
                 applyBackendStreamConfig(_theme.value, ip)
+                applyGridPreviewConfig(_theme.value, ip)
                 client.webSocket("ws://$ip:8000/ws") {
                     activeWsSession = this
                     send(Frame.Text(pass))
@@ -131,6 +148,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                         data.forEach { (hwnd, b64) ->
                                             gridPreviewCache[hwnd.toLong()] = b64.jsonPrimitive.content
                                         }
+                                        _lastSyncTime.value = System.currentTimeMillis()
                                     }
                                 }
                             } catch (e: Exception) { }
@@ -159,8 +177,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 val streamSettings = _theme.value
                 applyBackendStreamConfig(streamSettings, ip)
                 val liveUrl = "ws://$ip:8000/live/$hwnd" +
-                    "?use_wgc=${streamSettings.useWgc}" +
-                    "&max_dim=${streamSettings.streamMaxDim}" +
+                    "?max_dim=${streamSettings.streamMaxDim}" +
                     "&quality=${streamSettings.streamQuality}" +
                     "&fps=${streamSettings.streamFps}"
                 Log.i("TaskbarLive", "Connecting live stream: $liveUrl")
@@ -199,6 +216,176 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         _focusedLiveFrame.value = null
     }
 
+    fun startRemoteInput(hwnd: Long) {
+        inputJob?.cancel()
+        inputWsSession = null
+        _inputStatus.value = null
+        val ip = _pcIp.value
+        val pass = _password.value
+        if (ip.isEmpty() || hwnd == 0L) return
+        inputJob = viewModelScope.launch {
+            try {
+                client.webSocket("ws://$ip:8000/input/$hwnd") {
+                    inputWsSession = this
+                    remoteInputTarget = "window:$hwnd"
+                    send(Frame.Text(pass))
+                    for (frame in incoming) {
+                        if (frame is Frame.Text) {
+                            val text = frame.readText()
+                            Log.i("TaskbarInput", text)
+                            val message = runCatching {
+                                val json = Json.parseToJsonElement(text).jsonObject
+                                val type = json["type"]?.jsonPrimitive?.content
+                                val value = json["message"]?.jsonPrimitive?.content ?: text
+                                if (type == "error") "输入错误: $value" else null
+                            }.getOrNull()
+                            if (message != null) _inputStatus.value = message
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("TaskbarInput", "Remote input failed", e)
+                _inputStatus.value = "输入连接失败: ${e.message ?: e::class.java.simpleName}"
+            } finally {
+                inputWsSession = null
+                remoteInputTarget = null
+            }
+        }
+    }
+
+    fun startRemoteScreenInput(monitorIndex: Int) {
+        inputJob?.cancel()
+        inputWsSession = null
+        _inputStatus.value = null
+        val ip = _pcIp.value
+        val pass = _password.value
+        if (ip.isEmpty() || monitorIndex <= 0) return
+        inputJob = viewModelScope.launch {
+            try {
+                client.webSocket("ws://$ip:8000/input/screen/$monitorIndex") {
+                    inputWsSession = this
+                    remoteInputTarget = "screen:$monitorIndex"
+                    send(Frame.Text(pass))
+                    for (frame in incoming) {
+                        if (frame is Frame.Text) {
+                            val text = frame.readText()
+                            Log.i("TaskbarInput", text)
+                            val message = runCatching {
+                                val json = Json.parseToJsonElement(text).jsonObject
+                                val type = json["type"]?.jsonPrimitive?.content
+                                val value = json["message"]?.jsonPrimitive?.content ?: text
+                                if (type == "error") "输入错误: $value" else null
+                            }.getOrNull()
+                            if (message != null) _inputStatus.value = message
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("TaskbarInput", "Screen input failed", e)
+                _inputStatus.value = "输入连接失败: ${e.message ?: e::class.java.simpleName}"
+            } finally {
+                inputWsSession = null
+                remoteInputTarget = null
+            }
+        }
+    }
+
+    fun stopRemoteInput() {
+        inputJob?.cancel()
+        inputWsSession = null
+        remoteInputTarget = null
+    }
+
+    fun clearInputStatus() {
+        _inputStatus.value = null
+    }
+
+    fun sendRemoteInput(payload: JsonObject) {
+        viewModelScope.launch {
+            try {
+                val session = inputWsSession
+                if (session == null) {
+                    _inputStatus.value = "输入未连接"
+                    return@launch
+                }
+                session.send(Frame.Text(payload.toString()))
+            } catch (e: Exception) {
+                Log.e("TaskbarInput", "Send input failed", e)
+                _inputStatus.value = "输入发送失败: ${e.message ?: e::class.java.simpleName}"
+            }
+        }
+    }
+
+    fun sendMouseInput(action: String, x: Float, y: Float) {
+        sendRemoteInput(buildJsonObject {
+            put("type", "mouse")
+            put("action", action)
+            put("x", x.coerceIn(0f, 1f))
+            put("y", y.coerceIn(0f, 1f))
+        })
+    }
+
+    fun sendMouseButtonClick(button: String) {
+        sendRemoteInput(buildJsonObject {
+            put("type", "mouse")
+            put("action", "click")
+            put("button", button)
+            put("x", 0.5f)
+            put("y", 0.5f)
+        })
+    }
+
+    fun sendMouseWheel(delta: Int) {
+        sendRemoteInput(buildJsonObject {
+            put("type", "mouse")
+            put("action", "wheel")
+            put("delta", delta)
+            put("x", 0.5f)
+            put("y", 0.5f)
+        })
+    }
+
+    fun sendTouchInput(action: String, x: Float, y: Float) {
+        sendRemoteInput(buildJsonObject {
+            put("type", "touch")
+            put("action", action)
+            put("x", x.coerceIn(0f, 1f))
+            put("y", y.coerceIn(0f, 1f))
+        })
+    }
+
+    fun sendTextInput(text: String) {
+        if (text.isEmpty()) return
+        sendRemoteInput(buildJsonObject {
+            put("type", "text")
+            put("text", text)
+        })
+    }
+
+    fun sendKeyInput(key: String) {
+        sendRemoteInput(buildJsonObject {
+            put("type", "key")
+            put("key", key)
+        })
+    }
+
+    fun sendShortcut(shortcut: ShortcutConfig) {
+        sendRemoteInput(buildJsonObject {
+            put("type", "shortcut")
+            putJsonArray("keys") {
+                shortcut.keys.forEach { add(it) }
+            }
+        })
+    }
+
+    fun saveShortcuts(shortcuts: List<ShortcutConfig>) {
+        viewModelScope.launch { settingsManager.saveShortcuts(shortcuts) }
+    }
+
+    fun restoreDefaultShortcuts() {
+        saveShortcuts(defaultShortcutConfigs)
+    }
+
     fun rememberRowWindow(hwnd: Long) {
         _selectedRowHwnd.value = hwnd
     }
@@ -223,12 +410,14 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     fun updateTheme(newTheme: ThemeSettings) {
         val oldTheme = _theme.value
         if (
-            newTheme.useWgc != oldTheme.useWgc ||
             newTheme.streamMaxDim != oldTheme.streamMaxDim ||
             newTheme.streamQuality != oldTheme.streamQuality ||
             newTheme.streamFps != oldTheme.streamFps
         ) {
             viewModelScope.launch { applyBackendStreamConfig(newTheme) }
+        }
+        if (newTheme.gridPreviewIntervalMs != oldTheme.gridPreviewIntervalMs) {
+            viewModelScope.launch { applyGridPreviewConfig(newTheme) }
         }
         viewModelScope.launch { settingsManager.saveTheme(newTheme) }
     }
@@ -238,7 +427,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         if (ip.isEmpty()) return
         try {
             client.post("http://$ip:8000/config/wgc") {
-                parameter("enabled", settings.useWgc)
+                parameter("enabled", true)
                 parameter("max_dim", settings.streamMaxDim)
                 parameter("quality", settings.streamQuality)
                 parameter("fps", settings.streamFps)
@@ -246,10 +435,64 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         } catch (e: Exception) { }
     }
 
+    private suspend fun applyGridPreviewConfig(settings: ThemeSettings, ipOverride: String? = null) {
+        val ip = ipOverride ?: _pcIp.value
+        if (ip.isEmpty()) return
+        try {
+            client.post("http://$ip:8000/config/grid_preview") {
+                parameter("interval_ms", settings.gridPreviewIntervalMs)
+            }
+        } catch (e: Exception) { }
+    }
+
+    fun startLiveScreenStream(monitorIndex: Int) {
+        liveStreamJob?.cancel()
+        _focusedLiveFrame.value = null
+        val ip = _pcIp.value
+        if (ip.isEmpty() || monitorIndex <= 0) return
+        liveStreamJob = viewModelScope.launch {
+            try {
+                val streamSettings = _theme.value
+                applyBackendStreamConfig(streamSettings, ip)
+                val liveUrl = "ws://$ip:8000/live/screen/$monitorIndex" +
+                    "?max_dim=${streamSettings.streamMaxDim}" +
+                    "&quality=${streamSettings.streamQuality}" +
+                    "&fps=${streamSettings.streamFps}"
+                Log.i("TaskbarLive", "Connecting screen stream: $liveUrl")
+                client.webSocket(liveUrl) {
+                    for (frame in incoming) {
+                        if (frame is Frame.Binary) {
+                            _focusedLiveFrame.value = frame.readBytes()
+                        } else if (frame is Frame.Text) {
+                            Log.i("TaskbarLive", frame.readText())
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("TaskbarViewModel", "Screen stream failed", e)
+            }
+        }
+    }
+
+    fun fetchScreens() {
+        viewModelScope.launch {
+            val ip = _pcIp.value
+            if (ip.isEmpty()) return@launch
+            try {
+                val res: List<ScreenInfo> = client.get("http://$ip:8000/screens").body()
+                _screens.value = res
+                Log.i("TaskbarScreens", "Fetched screens: ${res.size}")
+            } catch (e: Exception) {
+                Log.e("TaskbarViewModel", "Fetch screens failed", e)
+                _inputStatus.value = "屏幕列表获取失败: ${e.localizedMessage}"
+            }
+        }
+    }
+
     fun saveWallpaper(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
             val path = settingsManager.copyImageToInternal(uri)
-            if (path.isNotEmpty()) { updateTheme(_theme.value.copy(bgImagePath = path)) }
+            if (path.isNotEmpty()) { updateTheme(_theme.value.copy(bgImagePath = path, showWallpaper = true)) }
         }
     }
 
