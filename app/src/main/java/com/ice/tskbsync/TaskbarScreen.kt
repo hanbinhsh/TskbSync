@@ -131,7 +131,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                 FilterChip(
                                     selected = landscapeInputMode == "touch",
                                     onClick = { landscapeInputMode = if (landscapeInputMode == "touch") "mouse" else "touch" },
-                                    label = { Text(if (landscapeInputMode == "touch") "触摸" else "鼠标") },
+                                    label = { Text(if (landscapeInputMode == "touch") "Touch" else "Mouse") },
                                     leadingIcon = { Icon(if (landscapeInputMode == "touch") Icons.Default.TouchApp else Icons.Default.Mouse, null, modifier = Modifier.size(18.dp)) }
                                 )
                                 IconButton(onClick = {
@@ -375,7 +375,7 @@ fun CarouselPagerMode(
     livePreviewCornerPx: Int,
     focusedLiveFrame: State<ByteArray?>,
     selectedRowHwnd: Long?,
-    // 删除了这里的 maxWidth 参数
+    // Removed the maxWidth parameter here
     onSwitch: (Long) -> Unit,
     onRowPageChange: (Long) -> Unit,
     onCenterChange: (Long?) -> Unit
@@ -437,7 +437,7 @@ fun CarouselPagerMode(
                 .clip(RoundedCornerShape(24.dp))
                 .background(containerColor.copy(alpha = containerAlpha))
         ) {
-            // 由于外部的参数已被删除，这里的 maxWidth 将 100% 正确指向当前 Box 的剩余实际可用宽度！
+            // Since the outer parameter was removed, maxWidth now correctly points to the current Box width.
             val sidePadding = (this.maxWidth - totalSlotWidth) / 2
 
             HorizontalPager(
@@ -682,32 +682,42 @@ fun LandscapeSingleMode(
                     ) {
                         IconButton(
                             onClick = onToggleMouseMode,
-                            modifier = Modifier
-                                .size(32.dp)
-                                .clip(CircleShape)
-                                .background(if (rightPanelMode == "mouse") accentColor.copy(alpha = 0.22f) else Color.Transparent)
+                            modifier = Modifier.size(32.dp)
                         ) {
-                            Icon(
-                                Icons.Default.Mouse,
-                                contentDescription = "Mouse panel",
-                                tint = if (rightPanelMode == "mouse") accentColor else titleColor.copy(alpha = 0.78f),
-                                modifier = Modifier.size(19.dp)
-                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .clip(CircleShape)
+                                    .background(if (rightPanelMode == "mouse") accentColor.copy(alpha = 0.18f) else Color.Transparent),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    Icons.Default.Mouse,
+                                    contentDescription = "Mouse panel",
+                                    tint = if (rightPanelMode == "mouse") accentColor else titleColor.copy(alpha = 0.78f),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                         Spacer(Modifier.width(4.dp))
                         IconButton(
                             onClick = onToggleScreenMode,
-                            modifier = Modifier
-                                .size(32.dp)
-                                .clip(CircleShape)
-                                .background(if (rightPanelMode == "screen") accentColor.copy(alpha = 0.22f) else Color.Transparent)
+                            modifier = Modifier.size(32.dp)
                         ) {
-                            Icon(
-                                Icons.Default.StayCurrentLandscape,
-                                contentDescription = "Screen panel",
-                                tint = if (rightPanelMode == "screen") accentColor else titleColor.copy(alpha = 0.78f),
-                                modifier = Modifier.size(19.dp)
-                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .clip(CircleShape)
+                                    .background(if (rightPanelMode == "screen") accentColor.copy(alpha = 0.18f) else Color.Transparent),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    Icons.Default.StayCurrentLandscape,
+                                    contentDescription = "Screen panel",
+                                    tint = if (rightPanelMode == "screen") accentColor else titleColor.copy(alpha = 0.78f),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
 
@@ -728,17 +738,17 @@ fun LandscapeSingleMode(
                                 onClick = onMouseLeftClick,
                                 contentPadding = PaddingValues(horizontal = 4.dp),
                                 modifier = Modifier.fillMaxWidth().height(34.dp)
-                            ) { Text("左键", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+                            ) { Text("Left", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
                             FilledTonalButton(
                                 onClick = onMouseMiddleClick,
                                 contentPadding = PaddingValues(horizontal = 4.dp),
                                 modifier = Modifier.fillMaxWidth().height(34.dp)
-                            ) { Text("中键", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+                            ) { Text("Middle", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
                             FilledTonalButton(
                                 onClick = onMouseRightClick,
                                 contentPadding = PaddingValues(horizontal = 4.dp),
                                 modifier = Modifier.fillMaxWidth().height(34.dp)
-                            ) { Text("右键", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+                            ) { Text("Right", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
                         }
                         Box(
                             modifier = Modifier
@@ -764,7 +774,7 @@ fun LandscapeSingleMode(
                                 },
                             contentAlignment = Alignment.Center
                         ) {
-                            Text("滚轮", fontSize = 10.sp, color = titleColor.copy(alpha = 0.8f))
+                            Text("Wheel", fontSize = 10.sp, color = titleColor.copy(alpha = 0.8f))
                         }
                     } else if (rightPanelMode == "screen") {
                         if (screens.isEmpty()) {
@@ -792,7 +802,7 @@ fun LandscapeSingleMode(
                                     ) {
                                         if (selected) Icon(Icons.Default.Check, null, tint = accentColor, modifier = Modifier.size(14.dp))
                                         Text(
-                                            "屏${screen.monitor_index}",
+                                            "Display ${screen.monitor_index}",
                                             color = titleColor,
                                             fontSize = 10.sp,
                                             maxLines = 1,
@@ -902,7 +912,7 @@ fun rememberPreviewBitmap(previewStr: String, hwnd: Long): android.graphics.Bitm
     var bitmap by remember(hwnd) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(previewStr) {
         if (previewStr.isNotEmpty()) {
-            // 将耗时的 Base64 解码和 Bitmap 转换放入 IO 线程！
+            // Move heavy Base64 decode and bitmap conversion to the IO thread.
             val newBitmap = withContext(Dispatchers.IO) {
                 val decodedString = Base64.decode(previewStr, Base64.DEFAULT)
                 BitmapFactory.decodeByteArray(decodedString, 0, decodedString.size)
@@ -935,7 +945,7 @@ fun rememberIconBitmap(iconStr: String, hwnd: Long): android.graphics.Bitmap? {
     var bitmap by remember(hwnd) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(iconStr) {
         if (iconStr.isNotEmpty()) {
-            // 同理，放入 IO 线程
+            // Same approach: run this on the IO thread.
             val newBitmap = withContext(Dispatchers.IO) {
                 val decodedString = Base64.decode(iconStr, Base64.DEFAULT)
                 BitmapFactory.decodeByteArray(decodedString, 0, decodedString.size)

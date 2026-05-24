@@ -9,11 +9,21 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileOutputStream
 
 val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+
+@Serializable
+data class WindowFilterSettings(
+    val enabled: Boolean = true,
+    val hideSystemWindows: Boolean = true,
+    val titleContains: List<String> = emptyList(),
+    val processNames: List<String> = emptyList(),
+    val classNames: List<String> = emptyList()
+)
 
 data class ThemeSettings(
     val color: Int,
@@ -61,6 +71,7 @@ class SettingsManager(private val context: Context) {
         private val GRID_PREVIEW_INTERVAL_MS_KEY = intPreferencesKey("grid_preview_interval_ms")
         private val CLIP_LIVE_PREVIEW_KEY = booleanPreferencesKey("clip_live_preview")
         private val LIVE_PREVIEW_CORNER_PX_KEY = intPreferencesKey("live_preview_corner_px")
+        private val WINDOW_FILTER_KEY = stringPreferencesKey("window_filter")
         private val SHORTCUTS_KEY = stringPreferencesKey("shortcuts")
     }
 
@@ -78,6 +89,18 @@ class SettingsManager(private val context: Context) {
                 Json.decodeFromString<List<ShortcutConfig>>(raw)
             } catch (e: Exception) {
                 defaultShortcutConfigs
+            }
+        }
+    }
+    val windowFilter: Flow<WindowFilterSettings> = context.dataStore.data.map { pref ->
+        val raw = pref[WINDOW_FILTER_KEY]
+        if (raw.isNullOrEmpty()) {
+            WindowFilterSettings()
+        } else {
+            try {
+                Json.decodeFromString<WindowFilterSettings>(raw)
+            } catch (e: Exception) {
+                WindowFilterSettings()
             }
         }
     }
@@ -112,6 +135,10 @@ class SettingsManager(private val context: Context) {
     suspend fun saveShowTitles(show: Boolean) { context.dataStore.edit { it[SHOW_TITLES_KEY] = show } }
     suspend fun saveShortcuts(shortcuts: List<ShortcutConfig>) {
         context.dataStore.edit { it[SHORTCUTS_KEY] = Json.encodeToString(shortcuts) }
+    }
+
+    suspend fun saveWindowFilter(settings: WindowFilterSettings) {
+        context.dataStore.edit { it[WINDOW_FILTER_KEY] = Json.encodeToString(settings) }
     }
 
     suspend fun saveTheme(settings: ThemeSettings) {

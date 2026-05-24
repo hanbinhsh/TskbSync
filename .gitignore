@@ -16,3 +16,4 @@ local.properties
 .kotlin
 .idea
 __pycache__
+pc_backend/logs/

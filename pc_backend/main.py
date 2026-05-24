@@ -145,14 +145,60 @@ def is_taskbar_window(hwnd):
     owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER); ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
     return not (ex_style & win32con.WS_EX_TOOLWINDOW) and (owner == 0 or (ex_style & win32con.WS_EX_APPWINDOW))
 
+def get_window_process_info(hwnd):
+    import os
+    import win32process
+    pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+    path = ""
+    try:
+        hproc = win32api.OpenProcess(win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ, False, pid)
+        path = win32process.GetModuleFileNameEx(hproc, 0)
+        win32api.CloseHandle(hproc)
+    except Exception:
+        path = ""
+    return pid, path, os.path.basename(path) if path else ""
+
+def should_filter_window(title, process_name, class_name):
+    if not WINDOW_FILTER_CONFIG["enabled"]:
+        return False
+    title_l = (title or "").casefold()
+    process_l = (process_name or "").casefold()
+    class_l = (class_name or "").casefold()
+    title_rules = list(WINDOW_FILTER_CONFIG["title_contains"])
+    process_rules = list(WINDOW_FILTER_CONFIG["process_names"])
+    class_rules = list(WINDOW_FILTER_CONFIG["class_names"])
+    if WINDOW_FILTER_CONFIG["hide_system_windows"]:
+        title_rules += DEFAULT_SYSTEM_TITLE_FILTERS
+        process_rules += DEFAULT_SYSTEM_PROCESS_FILTERS
+    if any(rule.casefold() in title_l for rule in title_rules if rule):
+        return True
+    if any(rule.casefold() == process_l for rule in process_rules if rule):
+        return True
+    if any(rule.casefold() == class_l for rule in class_rules if rule):
+        return True
+    return False
+
 def get_windows_list_minimal():
     windows = []
     foreground_hwnd = win32gui.GetForegroundWindow()
-    import win32process
     win32gui.EnumWindows(lambda h, _: windows.append(h) if is_taskbar_window(h) else None, None)
     res = []
     for h in windows:
-        res.append({"hwnd": h, "title": win32gui.GetWindowText(h), "icon": get_window_best_icon(h), "preview": "", "is_active": (h == foreground_hwnd), "pid": win32process.GetWindowThreadProcessId(h)[1]})
+        title = win32gui.GetWindowText(h)
+        class_name = win32gui.GetClassName(h)
+        pid, process_path, process_name = get_window_process_info(h)
+        if should_filter_window(title, process_name, class_name):
+            continue
+        res.append({
+            "hwnd": h,
+            "title": title,
+            "icon": get_window_best_icon(h),
+            "preview": "",
+            "is_active": (h == foreground_hwnd),
+            "pid": pid,
+            "process_name": process_name,
+            "class_name": class_name
+        })
     res.sort(key=lambda x: (x["pid"], x["hwnd"])); return res
 
 
@@ -168,6 +214,19 @@ LIVE_TARGET_FPS = 30.0
 GRID_PREVIEW_INTERVAL = 5.0
 current_obs_hwnd = 0
 connected_clients = set()
+DEFAULT_SYSTEM_TITLE_FILTERS = [
+    "Windows 输入体验",
+    "Windows Input Experience",
+    "Microsoft Text Input Application",
+]
+DEFAULT_SYSTEM_PROCESS_FILTERS = ["TextInputHost.exe"]
+WINDOW_FILTER_CONFIG = {
+    "enabled": True,
+    "hide_system_windows": True,
+    "title_contains": [],
+    "process_names": [],
+    "class_names": [],
+}
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -633,6 +692,35 @@ async def set_grid_preview(interval_ms: int = 2000):
     global GRID_PREVIEW_INTERVAL
     GRID_PREVIEW_INTERVAL = max(0.5, min(float(interval_ms) / 1000.0, 10.0))
     return {"interval_ms": int(GRID_PREVIEW_INTERVAL * 1000)}
+
+@app.post("/config/window_filter")
+async def set_window_filter(request: Request):
+    global WINDOW_FILTER_CONFIG
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    def clean_list(value):
+        if not isinstance(value, list):
+            return []
+        return [str(v).strip() for v in value if str(v).strip()]
+
+    WINDOW_FILTER_CONFIG = {
+        "enabled": bool(data.get("enabled", True)),
+        "hide_system_windows": bool(data.get("hide_system_windows", True)),
+        "title_contains": clean_list(data.get("title_contains", [])),
+        "process_names": clean_list(data.get("process_names", [])),
+        "class_names": clean_list(data.get("class_names", [])),
+    }
+    if connected_clients:
+        msg = json.dumps({"type": "list", "data": get_windows_list_minimal()})
+        for ws in list(connected_clients):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                pass
+    return WINDOW_FILTER_CONFIG
 
 @app.get("/screens")
 async def screens_endpoint():

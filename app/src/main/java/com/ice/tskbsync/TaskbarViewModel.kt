@@ -15,6 +15,7 @@ import io.ktor.client.plugins.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.websocket.*
 import io.ktor.client.request.*
+import io.ktor.http.*
 import io.ktor.serialization.kotlinx.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.websocket.*
@@ -85,6 +86,9 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _shortcuts = mutableStateOf(defaultShortcutConfigs)
     val shortcuts: State<List<ShortcutConfig>> = _shortcuts
 
+    private val _windowFilter = mutableStateOf(WindowFilterSettings())
+    val windowFilter: State<WindowFilterSettings> = _windowFilter
+
     private val _inputStatus = mutableStateOf<String?>(null)
     val inputStatus: State<String?> = _inputStatus
 
@@ -107,6 +111,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { settingsManager.gridColumns.collectLatest { _gridColumns.value = it } }
         viewModelScope.launch { settingsManager.showTitles.collectLatest { _showTitles.value = it } }
         viewModelScope.launch { settingsManager.shortcuts.collectLatest { _shortcuts.value = it } }
+        viewModelScope.launch { settingsManager.windowFilter.collectLatest { _windowFilter.value = it } }
 
         viewModelScope.launch {
             delay(1500)
@@ -122,6 +127,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             try {
                 applyBackendStreamConfig(_theme.value, ip)
                 applyGridPreviewConfig(_theme.value, ip)
+                applyWindowFilterConfig(_windowFilter.value, ip)
                 client.webSocket("ws://$ip:8000/ws") {
                     activeWsSession = this
                     send(Frame.Text(pass))
@@ -237,7 +243,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                 val json = Json.parseToJsonElement(text).jsonObject
                                 val type = json["type"]?.jsonPrimitive?.content
                                 val value = json["message"]?.jsonPrimitive?.content ?: text
-                                if (type == "error") "输入错误: $value" else null
+                                if (type == "error") "Input error: $value" else null
                             }.getOrNull()
                             if (message != null) _inputStatus.value = message
                         }
@@ -245,7 +251,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 }
             } catch (e: Exception) {
                 Log.e("TaskbarInput", "Remote input failed", e)
-                _inputStatus.value = "输入连接失败: ${e.message ?: e::class.java.simpleName}"
+                _inputStatus.value = "Input connection failed: ${e.message ?: e::class.java.simpleName}"
             } finally {
                 inputWsSession = null
                 remoteInputTarget = null
@@ -274,7 +280,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                 val json = Json.parseToJsonElement(text).jsonObject
                                 val type = json["type"]?.jsonPrimitive?.content
                                 val value = json["message"]?.jsonPrimitive?.content ?: text
-                                if (type == "error") "输入错误: $value" else null
+                                if (type == "error") "Input error: $value" else null
                             }.getOrNull()
                             if (message != null) _inputStatus.value = message
                         }
@@ -282,7 +288,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 }
             } catch (e: Exception) {
                 Log.e("TaskbarInput", "Screen input failed", e)
-                _inputStatus.value = "输入连接失败: ${e.message ?: e::class.java.simpleName}"
+                _inputStatus.value = "Input connection failed: ${e.message ?: e::class.java.simpleName}"
             } finally {
                 inputWsSession = null
                 remoteInputTarget = null
@@ -305,13 +311,13 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             try {
                 val session = inputWsSession
                 if (session == null) {
-                    _inputStatus.value = "输入未连接"
+                    _inputStatus.value = "Input not connected"
                     return@launch
                 }
                 session.send(Frame.Text(payload.toString()))
             } catch (e: Exception) {
                 Log.e("TaskbarInput", "Send input failed", e)
-                _inputStatus.value = "输入发送失败: ${e.message ?: e::class.java.simpleName}"
+                _inputStatus.value = "Input send failed: ${e.message ?: e::class.java.simpleName}"
             }
         }
     }
@@ -386,6 +392,13 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         saveShortcuts(defaultShortcutConfigs)
     }
 
+    fun updateWindowFilter(settings: WindowFilterSettings) {
+        viewModelScope.launch {
+            settingsManager.saveWindowFilter(settings)
+            applyWindowFilterConfig(settings)
+        }
+    }
+
     fun rememberRowWindow(hwnd: Long) {
         _selectedRowHwnd.value = hwnd
     }
@@ -445,6 +458,23 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         } catch (e: Exception) { }
     }
 
+    private suspend fun applyWindowFilterConfig(settings: WindowFilterSettings, ipOverride: String? = null) {
+        val ip = ipOverride ?: _pcIp.value
+        if (ip.isEmpty()) return
+        try {
+            client.post("http://$ip:8000/config/window_filter") {
+                contentType(ContentType.Application.Json)
+                setBody(buildJsonObject {
+                    put("enabled", settings.enabled)
+                    put("hide_system_windows", settings.hideSystemWindows)
+                    putJsonArray("title_contains") { settings.titleContains.forEach { add(it) } }
+                    putJsonArray("process_names") { settings.processNames.forEach { add(it) } }
+                    putJsonArray("class_names") { settings.classNames.forEach { add(it) } }
+                }.toString())
+            }
+        } catch (e: Exception) { }
+    }
+
     fun startLiveScreenStream(monitorIndex: Int) {
         liveStreamJob?.cancel()
         _focusedLiveFrame.value = null
@@ -484,7 +514,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 Log.i("TaskbarScreens", "Fetched screens: ${res.size}")
             } catch (e: Exception) {
                 Log.e("TaskbarViewModel", "Fetch screens failed", e)
-                _inputStatus.value = "屏幕列表获取失败: ${e.localizedMessage}"
+                _inputStatus.value = "Failed to fetch screen list: ${e.localizedMessage}"
             }
         }
     }

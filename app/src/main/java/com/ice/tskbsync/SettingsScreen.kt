@@ -35,6 +35,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val gridCols by viewModel.gridColumns
     val showTitles by viewModel.showTitles
     val shortcuts by viewModel.shortcuts
+    val windowFilter by viewModel.windowFilter
     
     var tempIp by remember { mutableStateOf(pcIp) }
     var tempPass by remember { mutableStateOf(password) }
@@ -42,6 +43,9 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     var tempContainerAlpha by remember { mutableStateOf(theme.containerAlpha) }
     var tempTopBarAlpha by remember { mutableStateOf(theme.topBarAlpha) }
     var tempRowAlpha by remember { mutableStateOf(theme.rowContainerAlpha) }
+    var titleFilterText by remember(windowFilter.titleContains) { mutableStateOf(windowFilter.titleContains.joinToString("\n")) }
+    var processFilterText by remember(windowFilter.processNames) { mutableStateOf(windowFilter.processNames.joinToString("\n")) }
+    var classFilterText by remember(windowFilter.classNames) { mutableStateOf(windowFilter.classNames.joinToString("\n")) }
     
     var colorPickerMode by remember { mutableStateOf("accent") } 
     var showColorDialog by remember { mutableStateOf(false) }
@@ -73,7 +77,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
             }
         ) { padding ->
             var selectedTab by remember { mutableIntStateOf(0) }
-            val tabs = listOf("连接", "显示", "外观", "快捷键")
+            val tabs = listOf("Connection", "Display", "Appearance", "Shortcuts")
 
             Column(modifier = Modifier.fillMaxSize().padding(padding)) {
                 TabRow(selectedTabIndex = selectedTab) {
@@ -189,6 +193,83 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     }
                                     StreamSlider("Grid Refresh", theme.gridPreviewIntervalMs, " ms", 500f..3000f, 24) {
                                         viewModel.updateTheme(theme.copy(gridPreviewIntervalMs = it))
+                                    }
+
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                                    Text("Window Filter", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Text("Enable Window Filter", modifier = Modifier.weight(1f))
+                                        Switch(
+                                            checked = windowFilter.enabled,
+                                            onCheckedChange = { viewModel.updateWindowFilter(windowFilter.copy(enabled = it)) }
+                                        )
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Text("Hide Common System Windows", modifier = Modifier.weight(1f))
+                                        Switch(
+                                            checked = windowFilter.hideSystemWindows,
+                                            onCheckedChange = { viewModel.updateWindowFilter(windowFilter.copy(hideSystemWindows = it)) }
+                                        )
+                                    }
+                                    OutlinedTextField(
+                                        value = titleFilterText,
+                                        onValueChange = {
+                                            titleFilterText = it
+                                            viewModel.updateWindowFilter(windowFilter.copy(
+                                                titleContains = parseRuleLines(it),
+                                                processNames = parseRuleLines(processFilterText),
+                                                classNames = parseRuleLines(classFilterText)
+                                            ))
+                                        },
+                                        label = { Text("Title keywords, one per line") },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        minLines = 2,
+                                        maxLines = 4
+                                    )
+                                    Spacer(Modifier.height(8.dp))
+                                    OutlinedTextField(
+                                        value = processFilterText,
+                                        onValueChange = {
+                                            processFilterText = it
+                                            viewModel.updateWindowFilter(windowFilter.copy(
+                                                titleContains = parseRuleLines(titleFilterText),
+                                                processNames = parseRuleLines(it),
+                                                classNames = parseRuleLines(classFilterText)
+                                            ))
+                                        },
+                                        label = { Text("Process names, one per line") },
+                                        supportingText = { Text("Example: TextInputHost.exe") },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        minLines = 2,
+                                        maxLines = 4
+                                    )
+                                    Spacer(Modifier.height(8.dp))
+                                    OutlinedTextField(
+                                        value = classFilterText,
+                                        onValueChange = {
+                                            classFilterText = it
+                                            viewModel.updateWindowFilter(windowFilter.copy(
+                                                titleContains = parseRuleLines(titleFilterText),
+                                                processNames = parseRuleLines(processFilterText),
+                                                classNames = parseRuleLines(it)
+                                            ))
+                                        },
+                                        label = { Text("Window class names, one per line") },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        minLines = 2,
+                                        maxLines = 4
+                                    )
+                                    TextButton(
+                                        onClick = {
+                                            titleFilterText = ""
+                                            processFilterText = ""
+                                            classFilterText = ""
+                                            viewModel.updateWindowFilter(WindowFilterSettings())
+                                        }
+                                    ) {
+                                        Icon(Icons.Default.Restore, null)
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("Restore Default Filter")
                                     }
                                 }
                             }
@@ -384,6 +465,9 @@ fun StreamSlider(
         )
     }
 }
+
+private fun parseRuleLines(text: String): List<String> =
+    text.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
 
 @Composable
 fun ShortcutEditDialog(

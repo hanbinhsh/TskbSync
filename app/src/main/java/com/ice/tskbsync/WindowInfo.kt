@@ -9,7 +9,9 @@ data class WindowInfo(
     val icon: String,
     val preview: String = "",
     val is_active: Boolean = false,
-    val pid: Int = 0
+    val pid: Int = 0,
+    val process_name: String = "",
+    val class_name: String = ""
 )
 
 @Serializable
