@@ -1,0 +1,367 @@
+package com.ice.tskbsync
+
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.navigation.NavController
+import kotlin.math.roundToInt
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
+    val pcIp by viewModel.pcIp
+    val password by viewModel.password
+    val theme by viewModel.theme
+    val discovered = viewModel.discoveredServers
+    val gridCols by viewModel.gridColumns
+    val showTitles by viewModel.showTitles
+    
+    var tempIp by remember { mutableStateOf(pcIp) }
+    var tempPass by remember { mutableStateOf(password) }
+    var tempBgAlpha by remember { mutableStateOf(theme.bgAlpha) }
+    var tempContainerAlpha by remember { mutableStateOf(theme.containerAlpha) }
+    var tempTopBarAlpha by remember { mutableStateOf(theme.topBarAlpha) }
+    var tempRowAlpha by remember { mutableStateOf(theme.rowContainerAlpha) }
+    
+    var colorPickerMode by remember { mutableStateOf("accent") } 
+    var showColorDialog by remember { mutableStateOf(false) }
+    
+    val themeColor = Color(theme.color)
+    val titleColor = Color(theme.titleColor)
+
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        uri?.let { viewModel.saveWallpaper(it) }
+    }
+
+    MaterialTheme(
+        colorScheme = MaterialTheme.colorScheme.copy(
+            primary = themeColor,
+            surface = lerp(MaterialTheme.colorScheme.surface, themeColor, 0.05f)
+        )
+    ) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("Settings", color = themeColor) },
+                    navigationIcon = {
+                        IconButton(onClick = { navController.popBackStack() }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = themeColor)
+                        }
+                    }
+                )
+            }
+        ) { padding ->
+            var selectedTab by remember { mutableIntStateOf(0) }
+            val tabs = listOf("连接", "显示", "外观")
+
+            Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+                TabRow(selectedTabIndex = selectedTab) {
+                    tabs.forEachIndexed { index, label ->
+                        Tab(
+                            selected = selectedTab == index,
+                            onClick = { selectedTab = index },
+                            text = { Text(label) }
+                        )
+                    }
+                }
+
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize().padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    when (selectedTab) {
+                        0 -> item {
+                            SectionTitle("Connection", themeColor)
+                            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                                Column(Modifier.padding(16.dp)) {
+                                    var expanded by remember { mutableStateOf(false) }
+                                    Box {
+                                        OutlinedTextField(
+                                            value = tempIp,
+                                            onValueChange = { tempIp = it },
+                                            label = { Text("Server IP") },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            singleLine = true,
+                                            trailingIcon = {
+                                                IconButton(onClick = {
+                                                    expanded = true
+                                                    viewModel.discoverServers()
+                                                }) { Icon(Icons.Default.ArrowDropDown, null) }
+                                            }
+                                        )
+                                        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                                            if (discovered.isEmpty()) {
+                                                DropdownMenuItem(text = { Text("Scanning...") }, onClick = {})
+                                            } else {
+                                                discovered.forEach { ip ->
+                                                    DropdownMenuItem(text = { Text(ip) }, onClick = { tempIp = ip; expanded = false })
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Spacer(Modifier.height(8.dp))
+                                    OutlinedTextField(
+                                        value = tempPass,
+                                        onValueChange = { tempPass = it },
+                                        label = { Text("Password") },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        singleLine = true,
+                                        leadingIcon = { Icon(Icons.Default.Lock, null) }
+                                    )
+                                    Spacer(Modifier.height(16.dp))
+                                    Button(
+                                        onClick = {
+                                            viewModel.updateSettings(tempIp, tempPass)
+                                            viewModel.connect(tempIp)
+                                            navController.popBackStack()
+                                        },
+                                        modifier = Modifier.fillMaxWidth().height(56.dp),
+                                        shape = RoundedCornerShape(16.dp)
+                                    ) {
+                                        Text("Apply and Connect", fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+
+                        1 -> item {
+                            SectionTitle("Display", themeColor)
+                            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                                Column(Modifier.padding(16.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text("Grid Columns: $gridCols")
+                                        Slider(
+                                            value = gridCols.toFloat(),
+                                            onValueChange = { viewModel.updateDisplaySettings(it.toInt(), showTitles) },
+                                            valueRange = 2f..6f,
+                                            steps = 3,
+                                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                                        )
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Text("Show Window Titles", modifier = Modifier.weight(1f))
+                                        Switch(checked = showTitles, onCheckedChange = { viewModel.updateDisplaySettings(gridCols, it) })
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Text("Show Window Previews", modifier = Modifier.weight(1f))
+                                        Switch(checked = theme.showPreviews, onCheckedChange = { viewModel.updateTheme(theme.copy(showPreviews = it)) })
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Text("Use Windows Graphics Capture", modifier = Modifier.weight(1f))
+                                        Switch(checked = theme.useWgc, onCheckedChange = { viewModel.updateTheme(theme.copy(useWgc = it)) })
+                                    }
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                                    StreamSlider("Stream Resolution", theme.streamMaxDim, "p", 360f..1440f, 8) {
+                                        viewModel.updateTheme(theme.copy(streamMaxDim = it))
+                                    }
+                                    StreamSlider("Stream Quality", theme.streamQuality, "%", 35f..95f, 11) {
+                                        viewModel.updateTheme(theme.copy(streamQuality = it))
+                                    }
+                                    StreamSlider("Stream FPS", theme.streamFps, " fps", 5f..60f, 10) {
+                                        viewModel.updateTheme(theme.copy(streamFps = it))
+                                    }
+                                }
+                            }
+                        }
+
+                        2 -> item {
+                            SectionTitle("Appearance", themeColor)
+                            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                                Column {
+                                    ColorListItem("Theme Accent", Color(theme.color)) { colorPickerMode = "accent"; showColorDialog = true }
+                                    ColorListItem("Text Color", Color(theme.titleColor)) { colorPickerMode = "text"; showColorDialog = true }
+                                    ColorListItem("Container Bg", Color(theme.containerColor)) { colorPickerMode = "container"; showColorDialog = true }
+                                    ColorListItem("Top Bar Color", Color(theme.topBarColor)) { colorPickerMode = "topbar"; showColorDialog = true }
+
+                                    OpacitySlider("Grid Opacity", tempContainerAlpha) {
+                                        tempContainerAlpha = it
+                                        viewModel.updateTheme(theme.copy(containerAlpha = it))
+                                    }
+                                    OpacitySlider("Row Opacity", tempRowAlpha) {
+                                        tempRowAlpha = it
+                                        viewModel.updateTheme(theme.copy(rowContainerAlpha = it))
+                                    }
+                                    OpacitySlider("Top Bar Opacity", tempTopBarAlpha) {
+                                        tempTopBarAlpha = it
+                                        viewModel.updateTheme(theme.copy(topBarAlpha = it))
+                                    }
+
+                                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+
+                                    ListItem(
+                                        headlineContent = { Text("Wallpaper") },
+                                        leadingContent = { Icon(Icons.Default.Image, null) },
+                                        trailingContent = {
+                                            IconButton(onClick = { launcher.launch("image/*") }) {
+                                                Icon(if (theme.bgImagePath.isEmpty()) Icons.Default.FileUpload else Icons.Default.Cached, null)
+                                            }
+                                        }
+                                    )
+                                    if (theme.bgImagePath.isNotEmpty()) {
+                                        Column(Modifier.padding(16.dp)) {
+                                            OpacitySlider("Wallpaper Opacity", tempBgAlpha) {
+                                                tempBgAlpha = it
+                                                viewModel.updateTheme(theme.copy(bgAlpha = it))
+                                            }
+                                            TextButton(onClick = { viewModel.updateTheme(theme.copy(bgImagePath = "")) }) {
+                                                Text("Remove Wallpaper", color = MaterialTheme.colorScheme.error)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showColorDialog) {
+        val currentSysPrimary = MaterialTheme.colorScheme.primary.toArgb()
+        ColorPickerDialog(
+            title = "Select ${colorPickerMode.replaceFirstChar { it.uppercase() }} Color",
+            onDismiss = { showColorDialog = false },
+            onColorSelected = { color ->
+                val newTheme = when(colorPickerMode) {
+                    "accent" -> theme.copy(color = color)
+                    "text" -> theme.copy(titleColor = color)
+                    "container" -> theme.copy(containerColor = color)
+                    "topbar" -> theme.copy(topBarColor = color)
+                    else -> theme
+                }
+                viewModel.updateTheme(newTheme)
+                showColorDialog = false
+            },
+            onSetDefault = {
+                val color = if (colorPickerMode == "text") 0xFFFFFFFF.toInt() else currentSysPrimary
+                val newTheme = when(colorPickerMode) {
+                    "accent" -> theme.copy(color = color)
+                    "text" -> theme.copy(titleColor = color)
+                    "container" -> theme.copy(containerColor = color)
+                    "topbar" -> theme.copy(topBarColor = color, topBarAlpha = 0f)
+                    else -> theme
+                }
+                viewModel.updateTheme(newTheme)
+                showColorDialog = false
+            }
+        )
+    }
+}
+
+@Composable
+fun ColorListItem(label: String, color: Color, onClick: () -> Unit) {
+    ListItem(
+        headlineContent = { Text(label) },
+        leadingContent = { Box(Modifier.size(24.dp).clip(CircleShape).background(color).clickable { onClick() }) },
+        trailingContent = { Icon(Icons.Default.Edit, null, modifier = Modifier.size(18.dp)) },
+        modifier = Modifier.clickable { onClick() },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+    )
+}
+
+@Composable
+fun OpacitySlider(label: String, value: Float, onValueChange: (Float) -> Unit) {
+    Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+        Text("$label: ${(value * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
+        Slider(value = value, onValueChange = onValueChange)
+    }
+}
+
+@Composable
+fun StreamSlider(
+    label: String,
+    value: Int,
+    suffix: String,
+    range: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    onValueChange: (Int) -> Unit
+) {
+    Column(Modifier.padding(vertical = 4.dp)) {
+        Text("$label: $value$suffix", style = MaterialTheme.typography.bodySmall)
+        Slider(
+            value = value.toFloat(),
+            onValueChange = { onValueChange(it.roundToInt()) },
+            valueRange = range,
+            steps = steps
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun ColorPickerDialog(title: String, onDismiss: () -> Unit, onColorSelected: (Int) -> Unit, onSetDefault: () -> Unit) {
+    var hexText by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                val colors = listOf(
+                    0xFF6200EE, 0xFF03DAC5, 0xFFF44336, 0xFF2196F3, 0xFF4CAF50, 0xFFFF9800,
+                    0xFFFFFFFF, 0xFF000000, 0xFF333333, 0xFF888888, 0xFFFFC107, 0xFF9C27B0
+                )
+                FlowRow(Modifier.fillMaxWidth(), maxItemsInEachRow = 4, horizontalArrangement = Arrangement.Center) {
+                    colors.forEach { color ->
+                        Box(
+                            Modifier.padding(6.dp).size(48.dp).clip(CircleShape).background(Color(color))
+                                .clickable { onColorSelected(color.toInt()) }
+                        )
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                OutlinedTextField(
+                    value = hexText,
+                    onValueChange = { 
+                        hexText = it.take(8)
+                        if (it.length == 6 || it.length == 8) {
+                            try {
+                                val c = if (it.length == 6) "FF$it" else it
+                                val parsed = c.toLong(16).toInt()
+                                onColorSelected(parsed)
+                            } catch (e: Exception) {}
+                        }
+                    },
+                    label = { Text("Custom Hex (e.g. FF6200EE)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Spacer(Modifier.height(16.dp))
+                Button(onClick = onSetDefault, modifier = Modifier.fillMaxWidth()) {
+                    Text("Set to Default")
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+@Composable
+fun SectionTitle(title: String, color: Color) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.Bold,
+        color = color,
+        modifier = Modifier.padding(bottom = 8.dp, top = 8.dp)
+    )
+}
