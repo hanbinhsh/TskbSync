@@ -15,6 +15,7 @@ import concurrent.futures
 import subprocess
 import shutil
 import os
+import uuid
 from pathlib import Path
 from ctypes import wintypes
 from contextlib import asynccontextmanager
@@ -186,6 +187,21 @@ _h264_encoder_probe_cache = {
     "error": "",
     "results": [],
 }
+_ffmpeg_gdigrab_probe_cache = {"probed": False, "usable": False, "message": ""}
+_native_streamer_probe_cache = {}
+
+def get_native_streamer_exe():
+    backend_dir = Path(__file__).resolve().parent
+    candidates = [
+        backend_dir / "native_streamer" / "build" / "tskbsync_native_streamer.exe",
+        backend_dir / "native_streamer" / "build" / "Release" / "tskbsync_native_streamer.exe",
+        backend_dir / "native_streamer" / "build" / "Debug" / "tskbsync_native_streamer.exe",
+        backend_dir / "bin" / "tskbsync_native_streamer.exe",
+    ]
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return str(path)
+    return ""
 
 def h264_encoder_option_variants(encoder, fps):
     fps_int = max(5, min(int(round(fps)), 160))
@@ -336,6 +352,31 @@ def h264_runtime_encoder_options(encoder, fps, width, height, quality):
         ], bitrate
     return h264_encoder_option_variants(encoder, fps_int)[-1][1], bitrate
 
+def h264_ddagrab_nvenc_options(fps, width, height, quality):
+    fps_int = max(5, min(int(round(fps)), 160))
+    bitrate = estimate_h264_bitrate_kbps(width, height, fps_int, quality)
+    maxrate = int(bitrate * 1.35)
+    bufsize = max(1000, int(bitrate * 0.5))
+    cq = max(18, min(32, int(round(34 - (max(35, min(quality, 100)) - 35) * 12 / 65))))
+    return [
+        "-c:v", "h264_nvenc",
+        "-preset", "p1",
+        "-tune", "ull",
+        "-rc", "vbr",
+        "-cq", str(cq),
+        "-b:v", f"{bitrate}k",
+        "-maxrate", f"{maxrate}k",
+        "-bufsize", f"{bufsize}k",
+        "-bf", "0",
+        "-g", str(fps_int),
+        "-forced-idr", "1",
+        "-aud", "1",
+        "-zerolatency", "1",
+        "-delay", "0",
+        "-rc-lookahead", "0",
+        "-surfaces", "4",
+    ], bitrate
+
 def probe_h264_encoder(ffmpeg, encoder):
     failures = []
     for profile, options in h264_encoder_option_variants(encoder, 30):
@@ -445,12 +486,21 @@ def get_h264_hardware_encoder(force_probe=False):
 
 def get_h264_status(force_probe=False):
     encoder = get_h264_hardware_encoder(force_probe=force_probe)
+    direct_ok, direct_message = probe_ffmpeg_gdigrab(force_probe=force_probe)
+    native_path = get_native_streamer_exe()
+    native_ok = bool(native_path)
+    native_message = "native streamer exe found; runtime capture is checked when a stream starts" if native_ok else "native streamer exe was not found"
     return {
         "ffmpeg_path": _h264_encoder_probe_cache.get("ffmpeg_path") or get_ffmpeg_exe() or "",
         "selected_encoder": encoder or "",
         "selected_profile": _h264_encoder_probe_cache.get("encoder_profile") or "",
         "usable": bool(encoder),
         "message": _h264_encoder_probe_cache.get("error") or ("Hardware H.264 encoder ready" if encoder else ""),
+        "native_streamer_path": native_path,
+        "native_screen_capture": native_ok,
+        "native_screen_message": native_message,
+        "direct_screen_capture": direct_ok,
+        "direct_screen_message": direct_message,
         "results": _h264_encoder_probe_cache.get("results") or [],
         "lookup_order": [
             "TSKBSYNC_FFMPEG",
@@ -460,6 +510,108 @@ def get_h264_status(force_probe=False):
             "PATH",
         ],
     }
+
+def probe_native_streamer(monitor_index=1, force_probe=False):
+    global _native_streamer_probe_cache
+    key = int(monitor_index or 1)
+    cached = _native_streamer_probe_cache.get(key)
+    if cached and not force_probe:
+        return bool(cached.get("usable")), cached.get("message", "")
+
+    exe = get_native_streamer_exe()
+    if not exe:
+        message = "native streamer exe was not found"
+        _native_streamer_probe_cache[key] = {"probed": True, "usable": False, "message": message}
+        return False, message
+    if not force_probe:
+        message = "native streamer exe found; runtime capture is checked when a stream starts"
+        _native_streamer_probe_cache[key] = {"probed": True, "usable": True, "message": message}
+        return True, message
+
+    try:
+        screen = get_screen_rect(key)
+        out_w, out_h = scaled_even_size(int(screen["width"]), int(screen["height"]), 640)
+        cmd = [
+            exe,
+            "--left", str(int(screen["left"])),
+            "--top", str(int(screen["top"])),
+            "--width", str(int(screen["width"])),
+            "--height", str(int(screen["height"])),
+            "--out-width", str(out_w),
+            "--out-height", str(out_h),
+            "--fps", "30",
+            "--quality", "60",
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            bufsize=0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=1.2)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate(timeout=1.0)
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        usable = bool(stdout)
+        message = "native streamer produced H.264 output" if usable else (stderr_text or f"native streamer exited with code {proc.returncode}")
+        _native_streamer_probe_cache[key] = {"probed": True, "usable": usable, "message": message}
+        return usable, message
+    except Exception as e:
+        message = f"{type(e).__name__}: {e}"
+        _native_streamer_probe_cache[key] = {"probed": True, "usable": False, "message": message}
+        return False, message
+
+def probe_ffmpeg_gdigrab(force_probe=False):
+    global _ffmpeg_gdigrab_probe_cache
+    if _ffmpeg_gdigrab_probe_cache.get("probed") and not force_probe:
+        return bool(_ffmpeg_gdigrab_probe_cache.get("usable")), _ffmpeg_gdigrab_probe_cache.get("message", "")
+    ffmpeg = get_ffmpeg_exe()
+    if not ffmpeg:
+        _ffmpeg_gdigrab_probe_cache = {"probed": True, "usable": False, "message": "ffmpeg.exe was not found"}
+        return False, _ffmpeg_gdigrab_probe_cache["message"]
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "gdigrab",
+        "-framerate",
+        "10",
+        "-video_size",
+        "16x16",
+        "-i",
+        "desktop",
+        "-t",
+        "0.05",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        message = result.stderr.decode("utf-8", errors="replace").strip()
+        usable = result.returncode == 0
+        _ffmpeg_gdigrab_probe_cache = {"probed": True, "usable": usable, "message": message}
+        return usable, message
+    except Exception as e:
+        message = f"{type(e).__name__}: {e}"
+        _ffmpeg_gdigrab_probe_cache = {"probed": True, "usable": False, "message": message}
+        return False, message
 
 def read_ffmpeg_stderr(proc):
     if not proc or proc.poll() is None or not proc.stderr:
@@ -484,6 +636,17 @@ def resize_for_stream(img_array, max_dim):
     if even_w != w or even_h != h:
         img_array = cv2.resize(img_array, (even_w, even_h), interpolation=cv2.INTER_AREA)
     return img_array
+
+def scaled_even_size(width, height, max_dim):
+    width = max(2, int(width))
+    height = max(2, int(height))
+    max_dim = max(2, float(max_dim))
+    scale = min(max_dim / width, max_dim / height, 1.0)
+    out_w = max(2, int(round(width * scale)))
+    out_h = max(2, int(round(height * scale)))
+    out_w -= out_w % 2
+    out_h -= out_h % 2
+    return max(2, out_w), max(2, out_h)
 
 def fit_frame_to_size(img_array, target_w, target_h):
     h, w = img_array.shape[:2]
@@ -690,9 +853,10 @@ TOUCH_MASK_ORIENTATION = 0x00000002
 TOUCH_MASK_PRESSURE = 0x00000004
 TOUCH_FLAG_NONE = 0x00000000
 TOUCH_FEEDBACK_DEFAULT = 0x1
+MAX_TOUCH_POINTERS = 10
 TOUCH_POINTER_ID = 0
 TOUCH_PRESSURE_NORMAL = 512
-INPUT_TOUCH_BUILD = "synthetic-touch-v3"
+INPUT_TOUCH_BUILD = "synthetic-touch-v4-multi"
 touch_initialized = False
 synthetic_touch_device = None
 
@@ -841,10 +1005,108 @@ def get_window_bounds(hwnd: int):
     except Exception:
         return tuple(map(int, win32gui.GetWindowRect(hwnd)))
 
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+class DXGI_OUTPUT_DESC(ctypes.Structure):
+    _fields_ = [
+        ("DeviceName", wintypes.WCHAR * 32),
+        ("DesktopCoordinates", wintypes.RECT),
+        ("AttachedToDesktop", wintypes.BOOL),
+        ("Rotation", ctypes.c_int),
+        ("Monitor", wintypes.HMONITOR),
+    ]
+
+def _guid_from_string(value: str):
+    return GUID.from_buffer_copy(uuid.UUID(value).bytes_le)
+
+def _com_call(ptr, index, restype, *argtypes):
+    vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtbl[index])
+
+def _release_com(ptr):
+    if ptr:
+        try:
+            _com_call(ptr, 2, ctypes.c_ulong)(ptr)
+        except Exception:
+            pass
+
+def enumerate_dxgi_outputs():
+    outputs = []
+    factory = ctypes.c_void_p()
+    try:
+        dxgi = ctypes.WinDLL("dxgi")
+        create_factory = dxgi.CreateDXGIFactory1
+        create_factory.argtypes = [ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
+        create_factory.restype = ctypes.c_long
+        iid_factory1 = _guid_from_string("770aae78-f26f-4dba-a829-253c83d1b387")
+        hr = create_factory(ctypes.byref(iid_factory1), ctypes.byref(factory))
+        if (hr & 0x80000000) or not factory.value:
+            raise RuntimeError(f"CreateDXGIFactory1 failed: 0x{hr & 0xffffffff:08x}")
+
+        enum_adapters = _com_call(factory, 12, ctypes.c_long, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))
+        adapter_idx = 0
+        while True:
+            adapter = ctypes.c_void_p()
+            hr = enum_adapters(factory, adapter_idx, ctypes.byref(adapter))
+            if (hr & 0xffffffff) == 0x887A0002:
+                break
+            if (hr & 0x80000000) or not adapter.value:
+                adapter_idx += 1
+                continue
+            try:
+                enum_outputs = _com_call(adapter, 7, ctypes.c_long, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))
+                output_idx = 0
+                while True:
+                    output = ctypes.c_void_p()
+                    hr = enum_outputs(adapter, output_idx, ctypes.byref(output))
+                    if (hr & 0xffffffff) == 0x887A0002:
+                        break
+                    if (hr & 0x80000000) or not output.value:
+                        output_idx += 1
+                        continue
+                    try:
+                        desc = DXGI_OUTPUT_DESC()
+                        get_desc = _com_call(output, 7, ctypes.c_long, ctypes.POINTER(DXGI_OUTPUT_DESC))
+                        hr_desc = get_desc(output, ctypes.byref(desc))
+                        if not (hr_desc & 0x80000000):
+                            rect = desc.DesktopCoordinates
+                            outputs.append({
+                                "adapter_idx": adapter_idx,
+                                "output_idx": output_idx,
+                                "device": str(desc.DeviceName),
+                                "hmonitor": int(desc.Monitor or 0),
+                                "left": int(rect.left),
+                                "top": int(rect.top),
+                                "right": int(rect.right),
+                                "bottom": int(rect.bottom),
+                                "width": int(rect.right - rect.left),
+                                "height": int(rect.bottom - rect.top),
+                            })
+                    finally:
+                        _release_com(output)
+                    output_idx += 1
+            finally:
+                _release_com(adapter)
+            adapter_idx += 1
+    except Exception as e:
+        print(f"[screens] dxgi enumerate failed: {type(e).__name__}: {e}", flush=True)
+    finally:
+        _release_com(factory)
+    return outputs
+
 def get_screens_list():
     screens = []
     try:
         monitors = win32api.EnumDisplayMonitors()
+        dxgi_outputs = enumerate_dxgi_outputs()
+        dxgi_by_hmonitor = {int(item["hmonitor"]): item for item in dxgi_outputs if int(item.get("hmonitor") or 0)}
+        dxgi_by_device = {str(item["device"]).lower(): item for item in dxgi_outputs if item.get("device")}
         primary_rect = (
             user32.GetSystemMetrics(0),
             user32.GetSystemMetrics(1),
@@ -855,10 +1117,20 @@ def get_screens_list():
             left, top, right, bottom = info.get("Monitor", rect)
             work = info.get("Work", (left, top, right, bottom))
             is_primary = bool(info.get("Flags", 0) & 1)
+            device = info.get("Device", f"Monitor {idx}")
+            dxgi_output = dxgi_by_hmonitor.get(int(handle)) or dxgi_by_device.get(str(device).lower())
             screens.append({
                 "monitor_index": idx,
-                "name": info.get("Device", f"Monitor {idx}"),
-                "device": info.get("Device", f"Monitor {idx}"),
+                "ddagrab_adapter_idx": int(dxgi_output["adapter_idx"]) if dxgi_output else 0,
+                "ddagrab_output_idx": int(dxgi_output["output_idx"]) if dxgi_output else idx - 1,
+                "ddagrab_left": int(dxgi_output["left"]) if dxgi_output else int(left),
+                "ddagrab_top": int(dxgi_output["top"]) if dxgi_output else int(top),
+                "ddagrab_right": int(dxgi_output["right"]) if dxgi_output else int(right),
+                "ddagrab_bottom": int(dxgi_output["bottom"]) if dxgi_output else int(bottom),
+                "ddagrab_width": int(dxgi_output["width"]) if dxgi_output else int(right - left),
+                "ddagrab_height": int(dxgi_output["height"]) if dxgi_output else int(bottom - top),
+                "name": device,
+                "device": device,
                 "left": int(left),
                 "top": int(top),
                 "right": int(right),
@@ -880,6 +1152,44 @@ def get_screen_rect(monitor_index: int):
         if int(screen["monitor_index"]) == int(monitor_index):
             return screen
     raise RuntimeError(f"screen not found: {monitor_index}")
+
+def get_screen_for_rect(left: int, top: int, right: int, bottom: int):
+    best = None
+    best_area = -1
+    for screen in get_screens_list():
+        ix_left = max(int(left), int(screen["left"]))
+        iy_top = max(int(top), int(screen["top"]))
+        ix_right = min(int(right), int(screen["right"]))
+        iy_bottom = min(int(bottom), int(screen["bottom"]))
+        area = max(0, ix_right - ix_left) * max(0, iy_bottom - iy_top)
+        if area > best_area:
+            best = screen
+            best_area = area
+    if best is None:
+        raise RuntimeError("no screen found")
+    return best
+
+def get_window_capture_region(hwnd: int):
+    if not win32gui.IsWindow(hwnd):
+        raise RuntimeError(f"window not found: {hwnd}")
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        time.sleep(0.08)
+    left, top, right, bottom = get_window_bounds(hwnd)
+    if right <= left or bottom <= top:
+        left, top, right, bottom = map(int, win32gui.GetWindowRect(hwnd))
+    if right <= left or bottom <= top:
+        raise RuntimeError(f"invalid window bounds: {left},{top},{right},{bottom}")
+    screen = get_screen_for_rect(left, top, right, bottom)
+    capture_left = max(int(left), int(screen["left"]))
+    capture_top = max(int(top), int(screen["top"]))
+    capture_right = min(int(right), int(screen["right"]))
+    capture_bottom = min(int(bottom), int(screen["bottom"]))
+    width = max(0, capture_right - capture_left)
+    height = max(0, capture_bottom - capture_top)
+    if width < 2 or height < 2:
+        raise RuntimeError(f"window is outside visible desktop: {left},{top},{right},{bottom}")
+    return screen, capture_left, capture_top, width, height
 
 def move_window_to_screen(hwnd: int, monitor_index: int):
     screen = get_screen_rect(monitor_index)
@@ -1052,6 +1362,9 @@ def build_screen_touch_info(monitor_index: int, data: dict):
     return build_touch_info_at_point(action, sx, sy)
 
 def build_touch_info_at_point(action: str, sx: int, sy: int):
+    return build_touch_info_at_point_with_id(action, sx, sy, TOUCH_POINTER_ID, True)
+
+def build_touch_info_at_point_with_id(action: str, sx: int, sy: int, pointer_id: int, primary: bool = False):
     tx, ty = to_virtual_screen_point(sx, sy)
 
     if action == "down":
@@ -1060,11 +1373,13 @@ def build_touch_info_at_point(action: str, sx: int, sy: int):
         flags = POINTER_FLAG_UP
     else:
         flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE
+    if primary:
+        flags |= POINTER_FLAG_PRIMARY
 
     contact_size = 4
     touch = POINTER_TOUCH_INFO()
     touch.pointerInfo.pointerType = PT_TOUCH
-    touch.pointerInfo.pointerId = TOUCH_POINTER_ID
+    touch.pointerInfo.pointerId = max(0, min(int(pointer_id), MAX_TOUCH_POINTERS - 1))
     touch.pointerInfo.pointerFlags = flags
     touch.pointerInfo.historyCount = 1
     touch.pointerInfo.ptPixelLocation = wintypes.POINT(tx, ty)
@@ -1082,7 +1397,7 @@ def inject_synthetic_touch(action: str, sx: int, sy: int, tx: int, ty: int, flag
     if not hasattr(user32, "CreateSyntheticPointerDevice") or not hasattr(user32, "InjectSyntheticPointerInput"):
         raise RuntimeError("Windows synthetic pointer API is unavailable")
     if not synthetic_touch_device:
-        synthetic_touch_device = user32.CreateSyntheticPointerDevice(PT_TOUCH, 1, TOUCH_FEEDBACK_DEFAULT)
+        synthetic_touch_device = user32.CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_POINTERS, TOUCH_FEEDBACK_DEFAULT)
         if not synthetic_touch_device:
             raise RuntimeError(f"CreateSyntheticPointerDevice failed: {ctypes.get_last_error()}")
 
@@ -1097,12 +1412,32 @@ def inject_synthetic_touch(action: str, sx: int, sy: int, tx: int, ty: int, flag
             f"typeSize={ctypes.sizeof(POINTER_TYPE_INFO)} build={INPUT_TOUCH_BUILD}"
         )
 
+def inject_synthetic_touches(touches: list[POINTER_TOUCH_INFO]):
+    global synthetic_touch_device
+    if not touches:
+        return
+    if not hasattr(user32, "CreateSyntheticPointerDevice") or not hasattr(user32, "InjectSyntheticPointerInput"):
+        raise RuntimeError("Windows synthetic pointer API is unavailable")
+    if not synthetic_touch_device:
+        synthetic_touch_device = user32.CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_POINTERS, TOUCH_FEEDBACK_DEFAULT)
+        if not synthetic_touch_device:
+            raise RuntimeError(f"CreateSyntheticPointerDevice failed: {ctypes.get_last_error()}")
+    arr = (POINTER_TYPE_INFO * len(touches))()
+    for idx, touch in enumerate(touches):
+        arr[idx].type = PT_TOUCH
+        arr[idx].u.touchInfo = touch
+    if not user32.InjectSyntheticPointerInput(synthetic_touch_device, arr, len(touches)):
+        raise RuntimeError(
+            f"InjectSyntheticPointerInput multi failed: {ctypes.get_last_error()} "
+            f"count={len(touches)} build={INPUT_TOUCH_BUILD}"
+        )
+
 def inject_legacy_touch(action: str, sx: int, sy: int, flags: int, touch: POINTER_TOUCH_INFO):
     global touch_initialized
     if not hasattr(user32, "InitializeTouchInjection") or not hasattr(user32, "InjectTouchInput"):
         raise RuntimeError("Windows touch injection API is unavailable")
     if not touch_initialized:
-        if not user32.InitializeTouchInjection(1, TOUCH_FEEDBACK_DEFAULT):
+        if not user32.InitializeTouchInjection(MAX_TOUCH_POINTERS, TOUCH_FEEDBACK_DEFAULT):
             raise RuntimeError(f"InitializeTouchInjection failed: {ctypes.get_last_error()}")
         touch_initialized = True
 
@@ -1112,6 +1447,23 @@ def inject_legacy_touch(action: str, sx: int, sy: int, flags: int, touch: POINTE
             f"action={action} flags=0x{flags:x} point=({sx},{sy}) "
             f"mask=0x{touch.touchMask:x} size={ctypes.sizeof(POINTER_TOUCH_INFO)} "
             f"build={INPUT_TOUCH_BUILD}"
+        )
+
+def inject_legacy_touches(touches: list[POINTER_TOUCH_INFO]):
+    global touch_initialized
+    if not touches:
+        return
+    if not hasattr(user32, "InitializeTouchInjection") or not hasattr(user32, "InjectTouchInput"):
+        raise RuntimeError("Windows touch injection API is unavailable")
+    if not touch_initialized:
+        if not user32.InitializeTouchInjection(MAX_TOUCH_POINTERS, TOUCH_FEEDBACK_DEFAULT):
+            raise RuntimeError(f"InitializeTouchInjection failed: {ctypes.get_last_error()}")
+        touch_initialized = True
+    arr = (POINTER_TOUCH_INFO * len(touches))(*touches)
+    if not user32.InjectTouchInput(len(touches), arr):
+        raise RuntimeError(
+            f"InjectTouchInput multi failed: {ctypes.get_last_error()} "
+            f"count={len(touches)} build={INPUT_TOUCH_BUILD}"
         )
 
 def handle_touch_input(hwnd: int, data: dict):
@@ -1125,12 +1477,59 @@ def handle_touch_input(hwnd: int, data: dict):
     else:
         inject_legacy_touch(action, sx, sy, flags, touch)
 
+def _point_action(point: dict):
+    action = str(point.get("action", "move")).lower()
+    if action in ("down", "up", "move"):
+        return action
+    return "move"
+
+def build_multi_touch_infos_for_window(hwnd: int, data: dict):
+    points = data.get("points") or []
+    touches = []
+    for idx, point in enumerate(points[:MAX_TOUCH_POINTERS]):
+        action = _point_action(point)
+        sx, sy = get_window_screen_point(hwnd, point.get("x", 0.0), point.get("y", 0.0))
+        pointer_id = int(point.get("id", idx))
+        primary = bool(point.get("primary", idx == 0))
+        _, _, _, _, _, _, touch = build_touch_info_at_point_with_id(action, sx, sy, pointer_id, primary)
+        touches.append(touch)
+    return touches
+
+def build_multi_touch_infos_for_screen(monitor_index: int, data: dict):
+    points = data.get("points") or []
+    touches = []
+    for idx, point in enumerate(points[:MAX_TOUCH_POINTERS]):
+        action = _point_action(point)
+        sx, sy = get_screen_point(monitor_index, point.get("x", 0.0), point.get("y", 0.0))
+        pointer_id = int(point.get("id", idx))
+        primary = bool(point.get("primary", idx == 0))
+        _, _, _, _, _, _, touch = build_touch_info_at_point_with_id(action, sx, sy, pointer_id, primary)
+        touches.append(touch)
+    return touches
+
+def handle_multi_touch_input(hwnd: int, data: dict):
+    points = data.get("points") or []
+    if any(_point_action(point) == "down" for point in points):
+        focus_window(hwnd, aggressive=True)
+    touches = build_multi_touch_infos_for_window(hwnd, data)
+    if hasattr(user32, "CreateSyntheticPointerDevice") and hasattr(user32, "InjectSyntheticPointerInput"):
+        inject_synthetic_touches(touches)
+    else:
+        inject_legacy_touches(touches)
+
 def handle_touch_screen_input(monitor_index: int, data: dict):
     action, sx, sy, tx, ty, flags, touch = build_screen_touch_info(monitor_index, data)
     if hasattr(user32, "CreateSyntheticPointerDevice") and hasattr(user32, "InjectSyntheticPointerInput"):
         inject_synthetic_touch(action, sx, sy, tx, ty, flags, touch)
     else:
         inject_legacy_touch(action, sx, sy, flags, touch)
+
+def handle_multi_touch_screen_input(monitor_index: int, data: dict):
+    touches = build_multi_touch_infos_for_screen(monitor_index, data)
+    if hasattr(user32, "CreateSyntheticPointerDevice") and hasattr(user32, "InjectSyntheticPointerInput"):
+        inject_synthetic_touches(touches)
+    else:
+        inject_legacy_touches(touches)
 
 @app.post("/switch/{hwnd}")
 async def switch_window(hwnd: int, request: Request):
@@ -1256,6 +1655,8 @@ async def input_endpoint(websocket: WebSocket, hwnd: int):
                     handle_mouse_input(hwnd, data)
                 elif event_type == "touch":
                     handle_touch_input(hwnd, data)
+                elif event_type == "touch_multi":
+                    handle_multi_touch_input(hwnd, data)
                 elif event_type == "text":
                     text = data.get("text", "")
                     print(f"[input] text hwnd={hwnd} chars={len(text)} text={text!r}", flush=True)
@@ -1301,6 +1702,8 @@ async def input_screen_endpoint(websocket: WebSocket, monitor_index: int):
                     handle_mouse_screen_input(monitor_index, data)
                 elif event_type == "touch":
                     handle_touch_screen_input(monitor_index, data)
+                elif event_type == "touch_multi":
+                    handle_multi_touch_screen_input(monitor_index, data)
                 elif event_type == "text":
                     send_unicode_text(data.get("text", ""))
                 elif event_type == "key":
@@ -1577,7 +1980,7 @@ async def stream_h264_capture(websocket: WebSocket, capture, label: str, stream_
         nonlocal output_chunks, output_bytes
         fd = proc.stdout.fileno()
         while not shutdown_event.is_set():
-            chunk = await asyncio.to_thread(os.read, fd, 4096)
+            chunk = await asyncio.to_thread(os.read, fd, 16384)
             if not chunk:
                 break
             await websocket.send_bytes(chunk)
@@ -1705,6 +2108,573 @@ async def stream_h264_capture(websocket: WebSocket, capture, label: str, stream_
             except Exception:
                 pass
 
+async def stream_h264_native_screen(websocket: WebSocket, monitor_index: int, stream_max_dim: float, stream_fps: float, stream_quality: int):
+    native_process = None
+    stderr_thread = None
+    try:
+        exe = get_native_streamer_exe()
+        if not exe:
+            await websocket.send_text(json.dumps({"type": "error", "message": "native streamer exe was not found"}))
+            return
+
+        screen = get_screen_rect(monitor_index)
+        src_w = int(screen["width"])
+        src_h = int(screen["height"])
+        out_w, out_h = scaled_even_size(src_w, src_h, stream_max_dim)
+        fps_int = max(5, min(int(round(stream_fps)), 160))
+        quality_int = max(35, min(int(round(stream_quality)), 100))
+        cmd = [
+            exe,
+            "--left", str(int(screen["left"])),
+            "--top", str(int(screen["top"])),
+            "--width", str(src_w),
+            "--height", str(src_h),
+            "--out-width", str(out_w),
+            "--out-height", str(out_h),
+            "--fps", str(fps_int),
+            "--quality", str(quality_int),
+        ]
+        print(
+            f"[h264-native] start screen={monitor_index} src={src_w}x{src_h} out={out_w}x{out_h} "
+            f"fps={fps_int} quality={quality_int}",
+            flush=True,
+        )
+        native_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            bufsize=0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        def drain_stderr():
+            try:
+                for raw in iter(native_process.stderr.readline, b""):
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line:
+                        print(line, flush=True)
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        await websocket.send_text(json.dumps({
+            "type": "video_config",
+            "codec": "h264",
+            "encoder": "native-mf",
+            "width": out_w,
+            "height": out_h,
+            "fps": fps_int,
+            "source": "native-wgc-mf",
+        }))
+
+        fd = native_process.stdout.fileno()
+        output_chunks = 0
+        output_bytes = 0
+        last_log_at = time.perf_counter()
+        last_log_bytes = 0
+        while not shutdown_event.is_set():
+            if native_process.poll() is not None:
+                raise RuntimeError(f"native streamer exited with code {native_process.returncode}")
+            chunk = await asyncio.to_thread(os.read, fd, 16384)
+            if not chunk:
+                break
+            await websocket.send_bytes(chunk)
+            output_chunks += 1
+            output_bytes += len(chunk)
+            now = time.perf_counter()
+            if now - last_log_at >= 3.0:
+                interval = max(0.001, now - last_log_at)
+                mbps = ((output_bytes - last_log_bytes) * 8.0 / 1_000_000.0) / interval
+                last_log_at = now
+                last_log_bytes = output_bytes
+                print(f"[h264-native] stats screen={monitor_index} net={mbps:.1f}Mbps chunks={output_chunks} bytes={output_bytes}", flush=True)
+    except Exception as e:
+        print(f"[h264-native] stream failed screen={monitor_index}: {type(e).__name__}: {e}", flush=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": f"{type(e).__name__}: {e}"}))
+        except Exception:
+            pass
+    finally:
+        if native_process:
+            try:
+                native_process.terminate()
+                try:
+                    await asyncio.to_thread(native_process.wait, 1.5)
+                except Exception:
+                    native_process.kill()
+            except Exception:
+                pass
+
+async def stream_h264_native_window(websocket: WebSocket, hwnd: int, stream_max_dim: float, stream_fps: float, stream_quality: int):
+    native_process = None
+    try:
+        exe = get_native_streamer_exe()
+        if not exe:
+            await websocket.send_text(json.dumps({"type": "error", "message": "native streamer exe was not found"}))
+            return
+        if not win32gui.IsWindow(hwnd):
+            await websocket.send_text(json.dumps({"type": "error", "message": f"window not found: {hwnd}"}))
+            return
+
+        left, top, right, bottom = get_window_bounds(hwnd)
+        src_w = max(2, int(right - left))
+        src_h = max(2, int(bottom - top))
+        out_w, out_h = scaled_even_size(src_w, src_h, stream_max_dim)
+        fps_int = max(5, min(int(round(stream_fps)), 160))
+        quality_int = max(35, min(int(round(stream_quality)), 100))
+        cmd = [
+            exe,
+            "--hwnd", str(int(hwnd)),
+            "--width", str(src_w),
+            "--height", str(src_h),
+            "--out-width", str(out_w),
+            "--out-height", str(out_h),
+            "--fps", str(fps_int),
+            "--quality", str(quality_int),
+        ]
+        title = win32gui.GetWindowText(hwnd)
+        print(
+            f"[h264-native] start hwnd={hwnd} title={title!r} src={src_w}x{src_h} out={out_w}x{out_h} "
+            f"fps={fps_int} quality={quality_int}",
+            flush=True,
+        )
+        native_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            bufsize=0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        def drain_stderr():
+            try:
+                for raw in iter(native_process.stderr.readline, b""):
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line:
+                        print(line, flush=True)
+            except Exception:
+                pass
+
+        threading.Thread(target=drain_stderr, daemon=True).start()
+
+        await websocket.send_text(json.dumps({
+            "type": "video_config",
+            "codec": "h264",
+            "encoder": "native-mf",
+            "width": out_w,
+            "height": out_h,
+            "fps": fps_int,
+            "source": "native-wgc-window-mf",
+        }))
+
+        fd = native_process.stdout.fileno()
+        output_chunks = 0
+        output_bytes = 0
+        last_log_at = time.perf_counter()
+        last_log_bytes = 0
+        while not shutdown_event.is_set():
+            if native_process.poll() is not None:
+                raise RuntimeError(f"native streamer exited with code {native_process.returncode}")
+            chunk = await asyncio.to_thread(os.read, fd, 16384)
+            if not chunk:
+                break
+            await websocket.send_bytes(chunk)
+            output_chunks += 1
+            output_bytes += len(chunk)
+            now = time.perf_counter()
+            if now - last_log_at >= 3.0:
+                interval = max(0.001, now - last_log_at)
+                mbps = ((output_bytes - last_log_bytes) * 8.0 / 1_000_000.0) / interval
+                last_log_at = now
+                last_log_bytes = output_bytes
+                print(f"[h264-native] stats hwnd={hwnd} net={mbps:.1f}Mbps chunks={output_chunks} bytes={output_bytes}", flush=True)
+    except Exception as e:
+        print(f"[h264-native] stream failed hwnd={hwnd}: {type(e).__name__}: {e}", flush=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": f"{type(e).__name__}: {e}"}))
+        except Exception:
+            pass
+    finally:
+        if native_process:
+            try:
+                native_process.terminate()
+                try:
+                    await asyncio.to_thread(native_process.wait, 1.5)
+                except Exception:
+                    native_process.kill()
+            except Exception:
+                pass
+
+async def stream_h264_direct_screen(websocket: WebSocket, monitor_index: int, stream_max_dim: float, stream_fps: float, stream_quality: int):
+    ffmpeg_process = None
+    try:
+        ffmpeg = get_ffmpeg_exe()
+        if not ffmpeg:
+            await websocket.send_text(json.dumps({"type": "error", "message": "ffmpeg.exe was not found"}))
+            return
+        encoder = get_h264_hardware_encoder()
+        if not encoder:
+            await websocket.send_text(json.dumps({"type": "error", "message": get_h264_probe_error()}))
+            return
+
+        screen = get_screen_rect(monitor_index)
+        src_w = int(screen["width"])
+        src_h = int(screen["height"])
+        out_w, out_h = scaled_even_size(src_w, src_h, stream_max_dim)
+        fps_int = max(5, min(int(round(stream_fps)), 160))
+        encoder_options, bitrate = h264_runtime_encoder_options(encoder, fps_int, out_w, out_h, stream_quality)
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-f",
+            "gdigrab",
+            "-draw_mouse",
+            "1",
+            "-framerate",
+            str(fps_int),
+            "-offset_x",
+            str(int(screen["left"])),
+            "-offset_y",
+            str(int(screen["top"])),
+            "-video_size",
+            f"{src_w}x{src_h}",
+            "-i",
+            "desktop",
+            "-an",
+            "-vf",
+            f"scale={out_w}:{out_h}:flags=fast_bilinear,format=yuv420p",
+            "-flags",
+            "low_delay",
+            *encoder_options,
+            "-flush_packets",
+            "1",
+            "-f",
+            "h264",
+            "pipe:1",
+        ]
+        profile = _h264_encoder_probe_cache.get("encoder_profile") or "default"
+        print(
+            f"[h264-direct] start screen={monitor_index} src={src_w}x{src_h} out={out_w}x{out_h} "
+            f"fps={fps_int} quality={stream_quality} encoder={encoder} profile={profile} target={bitrate}kbps",
+            flush=True,
+        )
+        ffmpeg_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        await websocket.send_text(json.dumps({
+            "type": "video_config",
+            "codec": "h264",
+            "encoder": encoder,
+            "width": out_w,
+            "height": out_h,
+            "fps": fps_int,
+            "source": "ffmpeg-gdigrab",
+        }))
+
+        fd = ffmpeg_process.stdout.fileno()
+        output_chunks = 0
+        output_bytes = 0
+        last_log_at = time.perf_counter()
+        last_log_bytes = 0
+        while not shutdown_event.is_set():
+            if ffmpeg_process.poll() is not None:
+                stderr = read_ffmpeg_stderr(ffmpeg_process)
+                raise RuntimeError(f"ffmpeg direct capture exited: {stderr}".strip())
+            chunk = await asyncio.to_thread(os.read, fd, 16384)
+            if not chunk:
+                break
+            await websocket.send_bytes(chunk)
+            output_chunks += 1
+            output_bytes += len(chunk)
+            now = time.perf_counter()
+            if now - last_log_at >= 3.0:
+                interval = max(0.001, now - last_log_at)
+                mbps = ((output_bytes - last_log_bytes) * 8.0 / 1_000_000.0) / interval
+                last_log_at = now
+                last_log_bytes = output_bytes
+                print(f"[h264-direct] stats screen={monitor_index} net={mbps:.1f}Mbps chunks={output_chunks} bytes={output_bytes}", flush=True)
+    except Exception as e:
+        print(f"[h264-direct] stream failed screen={monitor_index}: {type(e).__name__}: {e}", flush=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": f"{type(e).__name__}: {e}"}))
+        except Exception:
+            pass
+    finally:
+        if ffmpeg_process:
+            try:
+                ffmpeg_process.terminate()
+                try:
+                    await asyncio.to_thread(ffmpeg_process.wait, 1.5)
+                except Exception:
+                    ffmpeg_process.kill()
+            except Exception:
+                pass
+
+async def stream_h264_gdigrab_region(
+    websocket: WebSocket,
+    label: str,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+    stream_max_dim: float,
+    stream_fps: float,
+    stream_quality: int,
+):
+    ffmpeg_process = None
+    try:
+        ffmpeg = get_ffmpeg_exe()
+        if not ffmpeg:
+            await websocket.send_text(json.dumps({"type": "error", "message": "ffmpeg.exe was not found"}))
+            return
+        encoder = get_h264_hardware_encoder()
+        if not encoder:
+            await websocket.send_text(json.dumps({"type": "error", "message": get_h264_probe_error()}))
+            return
+
+        width = max(2, int(width) - int(width) % 2)
+        height = max(2, int(height) - int(height) % 2)
+        out_w, out_h = scaled_even_size(width, height, stream_max_dim)
+        fps_int = max(5, min(int(round(stream_fps)), 160))
+        encoder_options, bitrate = h264_runtime_encoder_options(encoder, fps_int, out_w, out_h, stream_quality)
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-f",
+            "gdigrab",
+            "-draw_mouse",
+            "1",
+            "-framerate",
+            str(fps_int),
+            "-offset_x",
+            str(int(left)),
+            "-offset_y",
+            str(int(top)),
+            "-video_size",
+            f"{width}x{height}",
+            "-i",
+            "desktop",
+            "-an",
+            "-vf",
+            f"scale={out_w}:{out_h}:flags=fast_bilinear,format=yuv420p",
+            "-flags",
+            "low_delay",
+            *encoder_options,
+            "-flush_packets",
+            "1",
+            "-f",
+            "h264",
+            "pipe:1",
+        ]
+        profile = _h264_encoder_probe_cache.get("encoder_profile") or "default"
+        print(
+            f"[h264-gdigrab] start {label} offset={left},{top} src={width}x{height} "
+            f"out={out_w}x{out_h} fps={fps_int} quality={stream_quality} encoder={encoder} profile={profile} target={bitrate}kbps",
+            flush=True,
+        )
+        ffmpeg_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            bufsize=0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        await asyncio.sleep(0.05)
+        if ffmpeg_process.poll() is not None:
+            stderr = read_ffmpeg_stderr(ffmpeg_process)
+            raise RuntimeError(f"ffmpeg gdigrab exited before config: {stderr}".strip())
+        await websocket.send_text(json.dumps({
+            "type": "video_config",
+            "codec": "h264",
+            "encoder": encoder,
+            "width": out_w,
+            "height": out_h,
+            "fps": fps_int,
+            "source": "ffmpeg-gdigrab-region",
+        }))
+
+        fd = ffmpeg_process.stdout.fileno()
+        output_chunks = 0
+        output_bytes = 0
+        last_log_at = time.perf_counter()
+        last_log_bytes = 0
+        while not shutdown_event.is_set():
+            if ffmpeg_process.poll() is not None:
+                stderr = read_ffmpeg_stderr(ffmpeg_process)
+                raise RuntimeError(f"ffmpeg gdigrab exited: {stderr}".strip())
+            chunk = await asyncio.to_thread(os.read, fd, 32768)
+            if not chunk:
+                break
+            await websocket.send_bytes(chunk)
+            output_chunks += 1
+            output_bytes += len(chunk)
+            now = time.perf_counter()
+            if now - last_log_at >= 3.0:
+                interval = max(0.001, now - last_log_at)
+                mbps = ((output_bytes - last_log_bytes) * 8.0 / 1_000_000.0) / interval
+                last_log_at = now
+                last_log_bytes = output_bytes
+                print(f"[h264-gdigrab] stats {label} net={mbps:.1f}Mbps chunks={output_chunks} bytes={output_bytes}", flush=True)
+    except Exception as e:
+        print(f"[h264-gdigrab] stream failed {label}: {type(e).__name__}: {e}", flush=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": f"{type(e).__name__}: {e}"}))
+        except Exception:
+            pass
+    finally:
+        if ffmpeg_process:
+            try:
+                ffmpeg_process.terminate()
+                try:
+                    await asyncio.to_thread(ffmpeg_process.wait, 1.5)
+                except Exception:
+                    ffmpeg_process.kill()
+            except Exception:
+                pass
+
+async def stream_h264_ddagrab(
+    websocket: WebSocket,
+    label: str,
+    adapter_idx: int,
+    output_idx: int,
+    offset_x: int,
+    offset_y: int,
+    width: int,
+    height: int,
+    out_width: int,
+    out_height: int,
+    stream_fps: float,
+    stream_quality: int,
+):
+    ffmpeg_process = None
+    try:
+        ffmpeg = get_ffmpeg_exe()
+        if not ffmpeg:
+            await websocket.send_text(json.dumps({"type": "error", "message": "ffmpeg.exe was not found"}))
+            return
+        selected_encoder = get_h264_hardware_encoder()
+        if selected_encoder != "h264_nvenc":
+            await websocket.send_text(json.dumps({"type": "error", "message": "ddagrab path currently requires h264_nvenc"}))
+            return
+
+        width = max(2, int(width) - int(width) % 2)
+        height = max(2, int(height) - int(height) % 2)
+        out_width = max(2, int(out_width) - int(out_width) % 2)
+        out_height = max(2, int(out_height) - int(out_height) % 2)
+        fps_int = max(5, min(int(round(stream_fps)), 160))
+        encoder_options, bitrate = h264_ddagrab_nvenc_options(fps_int, out_width, out_height, stream_quality)
+        ddagrab = (
+            f"ddagrab=output_idx={max(0, int(output_idx))}:"
+            f"framerate={fps_int}:"
+            f"offset_x={int(offset_x)}:"
+            f"offset_y={int(offset_y)}:"
+            f"video_size={width}x{height}:"
+            "draw_mouse=1"
+        )
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            ddagrab,
+            "-an",
+            "-vf",
+            f"hwdownload,format=bgra,scale={out_width}:{out_height}:flags=fast_bilinear,format=yuv420p",
+            "-flags",
+            "low_delay",
+            *encoder_options,
+            "-flush_packets",
+            "1",
+            "-f",
+            "h264",
+            "pipe:1",
+        ]
+        print(
+            f"[h264-dda] start {label} adapter_idx={adapter_idx} output_idx={output_idx} offset={offset_x},{offset_y} "
+            f"src={width}x{height} out={out_width}x{out_height} fps={fps_int} quality={stream_quality} target={bitrate}kbps",
+            flush=True,
+        )
+        ffmpeg_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            bufsize=0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        await asyncio.sleep(0.05)
+        if ffmpeg_process.poll() is not None:
+            stderr = read_ffmpeg_stderr(ffmpeg_process)
+            raise RuntimeError(f"ffmpeg ddagrab exited before config: {stderr}".strip())
+        await websocket.send_text(json.dumps({
+            "type": "video_config",
+            "codec": "h264",
+            "encoder": "ffmpeg-ddagrab-nvenc",
+            "width": out_width,
+            "height": out_height,
+            "fps": fps_int,
+            "source": "ffmpeg-ddagrab",
+        }))
+
+        fd = ffmpeg_process.stdout.fileno()
+        output_chunks = 0
+        output_bytes = 0
+        last_log_at = time.perf_counter()
+        last_log_bytes = 0
+        while not shutdown_event.is_set():
+            if ffmpeg_process.poll() is not None:
+                stderr = read_ffmpeg_stderr(ffmpeg_process)
+                raise RuntimeError(f"ffmpeg ddagrab exited: {stderr}".strip())
+            chunk = await asyncio.to_thread(os.read, fd, 32768)
+            if not chunk:
+                break
+            await websocket.send_bytes(chunk)
+            output_chunks += 1
+            output_bytes += len(chunk)
+            now = time.perf_counter()
+            if now - last_log_at >= 3.0:
+                interval = max(0.001, now - last_log_at)
+                mbps = ((output_bytes - last_log_bytes) * 8.0 / 1_000_000.0) / interval
+                last_log_at = now
+                last_log_bytes = output_bytes
+                print(f"[h264-dda] stats {label} net={mbps:.1f}Mbps chunks={output_chunks} bytes={output_bytes}", flush=True)
+    except Exception as e:
+        print(f"[h264-dda] stream failed {label}: {type(e).__name__}: {e}", flush=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": f"{type(e).__name__}: {e}"}))
+        except Exception:
+            pass
+    finally:
+        if ffmpeg_process:
+            try:
+                ffmpeg_process.terminate()
+                try:
+                    await asyncio.to_thread(ffmpeg_process.wait, 1.5)
+                except Exception:
+                    ffmpeg_process.kill()
+            except Exception:
+                pass
+
 @app.websocket("/live_h264/{hwnd}")
 async def live_h264_stream_endpoint(
     websocket: WebSocket,
@@ -1717,15 +2687,50 @@ async def live_h264_stream_endpoint(
     await websocket.accept()
     active_live_streams += 1
     try:
-        if not WGC_AVAILABLE:
-            await websocket.send_text(json.dumps({"type": "error", "message": "windows_capture is unavailable"}))
-            return
         stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 3840)))
         stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 100))
         stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 160)))
-        title = win32gui.GetWindowText(hwnd)
-        print(f"[h264] start WGC hwnd={hwnd} title={title!r} max_dim={stream_max_dim:.0f} quality={stream_quality} fps={stream_fps:.0f}", flush=True)
-        await stream_h264_capture(websocket, WindowsCapture(window_name=title, draw_border=False), f"hwnd={hwnd}", stream_max_dim, stream_fps, stream_quality)
+        title = win32gui.GetWindowText(hwnd) if win32gui.IsWindow(hwnd) else ""
+        screen, capture_left, capture_top, capture_w, capture_h = get_window_capture_region(hwnd)
+        encoder = get_h264_hardware_encoder()
+        if encoder == "h264_nvenc" and int(screen.get("ddagrab_adapter_idx", 0)) == 0:
+            ddagrab_left = int(screen.get("ddagrab_left", screen["left"]))
+            ddagrab_top = int(screen.get("ddagrab_top", screen["top"]))
+            offset_x = max(0, int(capture_left) - ddagrab_left)
+            offset_y = max(0, int(capture_top) - ddagrab_top)
+            output_idx = int(screen.get("ddagrab_output_idx", int(screen["monitor_index"]) - 1))
+            out_w, out_h = scaled_even_size(capture_w, capture_h, stream_max_dim)
+            await stream_h264_ddagrab(
+                websocket,
+                f"hwnd={hwnd} title={title!r} screen={screen.get('monitor_index')}",
+                int(screen.get("ddagrab_adapter_idx", 0)),
+                output_idx,
+                offset_x,
+                offset_y,
+                capture_w,
+                capture_h,
+                out_w,
+                out_h,
+                stream_fps,
+                stream_quality,
+            )
+            return
+        print(
+            f"[h264] using gdigrab window region hwnd={hwnd} screen={screen.get('monitor_index')} "
+            f"encoder={encoder or 'none'} adapter_idx={screen.get('ddagrab_adapter_idx', 0)}",
+            flush=True,
+        )
+        await stream_h264_gdigrab_region(
+            websocket,
+            f"hwnd={hwnd} title={title!r} screen={screen.get('monitor_index')}",
+            capture_left,
+            capture_top,
+            capture_w,
+            capture_h,
+            stream_max_dim,
+            stream_fps,
+            stream_quality,
+        )
     finally:
         active_live_streams = max(0, active_live_streams - 1)
         await safe_close(websocket)
@@ -1742,14 +2747,46 @@ async def live_h264_screen_stream_endpoint(
     await websocket.accept()
     active_live_streams += 1
     try:
-        if not WGC_AVAILABLE:
-            await websocket.send_text(json.dumps({"type": "error", "message": "windows_capture is unavailable"}))
-            return
         _ = get_screen_rect(monitor_index)
         stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 3840)))
         stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 100))
         stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 160)))
-        print(f"[h264] start WGC screen={monitor_index} max_dim={stream_max_dim:.0f} quality={stream_quality} fps={stream_fps:.0f}", flush=True)
+        encoder = get_h264_hardware_encoder()
+        if encoder == "h264_nvenc":
+            screen = get_screen_rect(monitor_index)
+            capture_w = int(screen.get("ddagrab_width") or screen["width"])
+            capture_h = int(screen.get("ddagrab_height") or screen["height"])
+            out_w, out_h = scaled_even_size(capture_w, capture_h, stream_max_dim)
+            adapter_idx = int(screen.get("ddagrab_adapter_idx", 0))
+            output_idx = int(screen.get("ddagrab_output_idx", int(monitor_index) - 1))
+            if adapter_idx != 0:
+                print(
+                    f"[h264] ddagrab skipped screen={monitor_index}: output is on adapter_idx={adapter_idx}; using gdigrab hardware path",
+                    flush=True,
+                )
+                await stream_h264_direct_screen(websocket, monitor_index, stream_max_dim, stream_fps, stream_quality)
+                return
+            await stream_h264_ddagrab(
+                websocket,
+                f"screen={monitor_index} device={screen.get('device', '')}",
+                adapter_idx,
+                output_idx,
+                0,
+                0,
+                capture_w,
+                capture_h,
+                out_w,
+                out_h,
+                stream_fps,
+                stream_quality,
+            )
+            return
+        if not WGC_AVAILABLE:
+            message = f"ddagrab requires h264_nvenc; selected encoder={encoder or 'none'}; windows_capture is unavailable"
+            print(f"[h264] hardware screen stream unavailable screen={monitor_index}: {message}", flush=True)
+            await websocket.send_text(json.dumps({"type": "error", "message": message}))
+            return
+        print(f"[h264] ddagrab unavailable screen={monitor_index}: selected encoder={encoder or 'none'}; using WGC jpeg-compatible screen path", flush=True)
         await stream_h264_capture(websocket, WindowsCapture(monitor_index=monitor_index, draw_border=False), f"screen={monitor_index}", stream_max_dim, stream_fps, stream_quality)
     finally:
         active_live_streams = max(0, active_live_streams - 1)

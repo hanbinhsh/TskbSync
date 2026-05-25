@@ -4,6 +4,7 @@ import android.graphics.BitmapFactory
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.util.Base64
+import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -39,6 +40,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -66,7 +68,9 @@ import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlinx.coroutines.Dispatchers
@@ -100,12 +104,12 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val containerBgBase = Color(theme.containerColor)
     val topBarColor = Color(theme.topBarColor).copy(alpha = theme.topBarAlpha)
     val bgColor = lerp(MaterialTheme.colorScheme.surface, accentColor, 0.1f)
-    var isLandscapeSingleMode by remember { mutableStateOf(false) }
-    var showLandscapeShortcutBar by remember { mutableStateOf(false) }
-    var showWindowControlBar by remember { mutableStateOf(false) }
-    var landscapeInputMode by remember { mutableStateOf("touch") }
-    var rightPanelMode by remember { mutableStateOf<String?>(null) } // null/window list, "mouse", "screen"
-    var selectedScreenIndex by remember { mutableStateOf<Int?>(null) }
+    var isLandscapeSingleMode by rememberSaveable { mutableStateOf(false) }
+    var showLandscapeShortcutBar by rememberSaveable { mutableStateOf(false) }
+    var showWindowControlBar by rememberSaveable { mutableStateOf(false) }
+    var landscapeInputMode by rememberSaveable { mutableStateOf("touch") }
+    var rightPanelMode by rememberSaveable { mutableStateOf<String?>(null) } // null/window list, "mouse", "screen"
+    var selectedScreenIndex by rememberSaveable { mutableStateOf<Int?>(null) }
     var keyboardText by remember { mutableStateOf(TextFieldValue("")) }
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -249,7 +253,16 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     tint = titleColor
                                 )
                             }
-                            IconButton(onClick = { viewModel.toggleLayout() }) {
+                            IconButton(onClick = {
+                                viewModel.toggleLayout()
+                                if (isLandscapeSingleMode) {
+                                    isLandscapeSingleMode = false
+                                    showLandscapeShortcutBar = false
+                                    rightPanelMode = null
+                                    selectedScreenIndex = null
+                                    viewModel.stopRemoteInput()
+                                }
+                            }) {
                                 Icon(if (layoutMode == "grid") Icons.Default.ViewStream else Icons.Default.GridView, null, tint = titleColor)
                             }
                             IconButton(onClick = { navController.navigate("settings") }) {
@@ -308,6 +321,11 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                 if (isLandscapeSingleMode) {
                     BoxWithConstraints(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
                         val isAlreadyLandscape = maxWidth > maxHeight
+                        val landscapePreviewUsesH264 = if (selectedScreenIndex != null) {
+                            theme.useHardwareEncoding
+                        } else {
+                            theme.useHighPerformanceWindowStreaming
+                        }
                         val landscapeContent: @Composable BoxScope.() -> Unit = {
                             if (!isConnected) {
                                 ConnectionStatusPlaceholder(pcIp, error, titleColor) { viewModel.connect(pcIp) }
@@ -320,7 +338,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     containerAlpha = theme.rowContainerAlpha,
                                     showTitles = showTitles,
                                     showPreviews = theme.showPreviews,
-                                    useHardwareEncoding = theme.useHardwareEncoding,
+                                    useHardwareEncoding = landscapePreviewUsesH264,
                                     clipLivePreview = theme.clipLivePreview,
                                     livePreviewCornerPx = theme.livePreviewCornerPx,
                                     focusedLiveFrame = viewModel.focusedLiveFrame,
@@ -331,20 +349,17 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     onDismissInputStatus = { viewModel.clearInputStatus() },
                                     selectedRowHwnd = viewModel.selectedRowHwnd.value,
                                     rightPanelMode = rightPanelMode,
-                                    screens = viewModel.screens.value,
+                                    screens = screens,
                                     selectedScreenIndex = selectedScreenIndex,
                                     inputMode = landscapeInputMode,
                                     onToggleMouseMode = {
                                         rightPanelMode = if (rightPanelMode == "mouse") null else "mouse"
-                                        selectedScreenIndex = null
                                     },
                                     onToggleScreenMode = {
                                         val next = if (rightPanelMode == "screen") null else "screen"
                                         rightPanelMode = next
                                         if (next == "screen") {
                                             viewModel.fetchScreens()
-                                        } else {
-                                            selectedScreenIndex = null
                                         }
                                     },
                                     onScreenSelected = { screen ->
@@ -364,10 +379,15 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     onStopInput = { viewModel.stopRemoteInput() },
                                     onMouseInput = { action, x, y -> viewModel.sendMouseInput(action, x, y) },
                                     onTouchInput = { action, x, y -> viewModel.sendTouchInput(action, x, y) },
+                                    onMultiTouchInput = { points -> viewModel.sendMultiTouchInput(points) },
                                     onCenterChange = { hwnd ->
-                                        if (rightPanelMode != "screen") selectedScreenIndex = null
-                                        if (hwnd != null) viewModel.startLiveStream(hwnd)
-                                        else viewModel.stopLiveStream()
+                                        if (hwnd != null) {
+                                            selectedScreenIndex = null
+                                            viewModel.startLiveStream(hwnd)
+                                            viewModel.startRemoteInput(hwnd)
+                                        } else {
+                                            viewModel.stopLiveStream()
+                                        }
                                     }
                                 )
                             }
@@ -431,7 +451,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         containerColor = containerBgBase,
                                         containerAlpha = theme.rowContainerAlpha,
                                         showPreviews = theme.showPreviews,
-                                        useHardwareEncoding = theme.useHardwareEncoding,
+                                        useHardwareEncoding = theme.useHighPerformanceWindowStreaming,
                                         clipLivePreview = theme.clipLivePreview,
                                         livePreviewCornerPx = theme.livePreviewCornerPx,
                                         focusedLiveFrame = viewModel.focusedLiveFrame,
@@ -620,6 +640,7 @@ fun LandscapeSingleMode(
     onStopInput: () -> Unit,
     onMouseInput: (String, Float, Float) -> Unit,
     onTouchInput: (String, Float, Float) -> Unit,
+    onMultiTouchInput: (List<TouchPointInput>) -> Unit,
     onCenterChange: (Long?) -> Unit
 ) {
     if (windows.isEmpty()) return
@@ -634,15 +655,15 @@ fun LandscapeSingleMode(
         liveBitmapState?.value?.let { it.width to it.height }
     }
 
-    LaunchedEffect(currentWindow.hwnd, showPreviews, rightPanelMode) {
+    LaunchedEffect(currentWindow.hwnd, showPreviews, selectedScreenIndex) {
         onRowPageChange(currentWindow.hwnd)
-        if (rightPanelMode != "screen") {
+        if (selectedScreenIndex == null) {
             onCenterChange(if (showPreviews) currentWindow.hwnd else null)
         }
     }
 
     DisposableEffect(currentWindow.hwnd) {
-        onStartInput(currentWindow.hwnd)
+        if (selectedScreenIndex == null) onStartInput(currentWindow.hwnd)
         onDispose { onStopInput() }
     }
 
@@ -701,19 +722,50 @@ fun LandscapeSingleMode(
                                         var lastX = startX
                                         var lastY = startY
                                         var moved = false
-                                        if (inputMode == "touch") onTouchInput("down", startX, startY) else onMouseInput("move", startX, startY)
+                                        if (inputMode == "touch") {
+                                            onMultiTouchInput(
+                                                listOf(
+                                                    TouchPointInput(
+                                                        id = (down.id.value % 10L).toInt(),
+                                                        action = "down",
+                                                        x = startX,
+                                                        y = startY,
+                                                        primary = true
+                                                    )
+                                                )
+                                            )
+                                        } else {
+                                            onMouseInput("move", startX, startY)
+                                        }
 
                                         do {
                                             val event = awaitPointerEvent()
                                             val change = event.changes.firstOrNull() ?: break
                                             val (x, y) = normalizedInPreview(change.position.x, change.position.y)
                                             if (abs(x - startX) > 0.006f || abs(y - startY) > 0.006f) moved = true
-                                            if (change.pressed) {
-                                                if (inputMode == "touch") onTouchInput("move", x, y) else onMouseInput("move", x, y)
+                                            if (inputMode == "touch") {
+                                                val points = event.changes.mapNotNull { pointer ->
+                                                    if (!pointer.pressed && !pointer.previousPressed) return@mapNotNull null
+                                                    val (px, py) = normalizedInPreview(pointer.position.x, pointer.position.y)
+                                                    val action = when {
+                                                        pointer.pressed && !pointer.previousPressed -> "down"
+                                                        pointer.pressed && pointer.previousPressed -> "move"
+                                                        !pointer.pressed && pointer.previousPressed -> "up"
+                                                        else -> "move"
+                                                    }
+                                                    TouchPointInput(
+                                                        id = (pointer.id.value % 10L).toInt(),
+                                                        action = action,
+                                                        x = px,
+                                                        y = py,
+                                                        primary = pointer.id == down.id
+                                                    )
+                                                }
+                                                onMultiTouchInput(points)
+                                            } else if (change.pressed) {
+                                                onMouseInput("move", x, y)
                                             } else {
-                                                if (inputMode == "touch") {
-                                                    onTouchInput("up", x, y)
-                                                } else if (!moved) {
+                                                if (!moved) {
                                                     onMouseInput("click", x, y)
                                                 } else {
                                                     onMouseInput("move", x, y)
@@ -1212,45 +1264,137 @@ fun H264PreviewContainer(
 
     LaunchedEffect(surface, config) {
         val targetSurface = surface ?: return@LaunchedEffect
-        val codec = MediaCodec.createDecoderByType("video/avc")
         val parser = AnnexBNalParser()
         val bufferInfo = MediaCodec.BufferInfo()
+        var codec: MediaCodec? = null
+        var sps: ByteArray? = null
+        var pps: ByteArray? = null
+        val pendingFrameNals = mutableListOf<ByteArray>()
         var ptsUs = 0L
+        val frameDurationUs = 1_000_000L / config.fps.coerceAtLeast(1)
+        var queuedUnits = 0
+        var renderedUnits = 0
+        var seenKeyFrame = false
+        var observedNals = 0
         fun drainOutput() {
-            var outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+            val activeCodec = codec ?: return
+            var outputIndex = activeCodec.dequeueOutputBuffer(bufferInfo, 0)
             while (outputIndex >= 0) {
-                codec.releaseOutputBuffer(outputIndex, true)
-                outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+                activeCodec.releaseOutputBuffer(outputIndex, true)
+                renderedUnits++
+                outputIndex = activeCodec.dequeueOutputBuffer(bufferInfo, 0)
             }
         }
-        try {
+        fun configureDecoderIfReady(): MediaCodec? {
+            codec?.let { return it }
+            val spsBytes = sps ?: return null
+            val ppsBytes = pps ?: return null
             val format = MediaFormat.createVideoFormat("video/avc", config.width, config.height)
-            codec.configure(format, targetSurface, null, 0)
-            codec.start()
+            runCatching { format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1) }
+            runCatching { format.setInteger(MediaFormat.KEY_FRAME_RATE, config.fps.coerceAtLeast(1)) }
+            format.setByteBuffer("csd-0", ByteBuffer.wrap(spsBytes))
+            format.setByteBuffer("csd-1", ByteBuffer.wrap(ppsBytes))
+            val newCodec = MediaCodec.createDecoderByType("video/avc")
+            newCodec.configure(format, targetSurface, null, 0)
+            newCodec.start()
+            codec = newCodec
+            Log.i("TaskbarH264", "decoder configured ${config.width}x${config.height} fps=${config.fps} sps=${spsBytes.size} pps=${ppsBytes.size}")
+            return newCodec
+        }
+        fun queueAccessUnit(accessUnit: ByteArray, flags: Int) {
+            val activeCodec = configureDecoderIfReady() ?: return
+            drainOutput()
+            var inputIndex = activeCodec.dequeueInputBuffer(5_000)
+            var attempts = 0
+            while (inputIndex < 0 && attempts < 4) {
+                drainOutput()
+                inputIndex = activeCodec.dequeueInputBuffer(5_000)
+                attempts++
+            }
+            if (inputIndex < 0) return
+            val inputBuffer = activeCodec.getInputBuffer(inputIndex)
+            inputBuffer?.clear()
+            if (inputBuffer != null && accessUnit.size <= inputBuffer.capacity()) {
+                inputBuffer.put(accessUnit)
+                activeCodec.queueInputBuffer(inputIndex, 0, accessUnit.size, ptsUs, flags)
+                queuedUnits++
+                ptsUs += frameDurationUs
+                if (queuedUnits % 120 == 0) {
+                    Log.i("TaskbarH264", "queued=$queuedUnits rendered=$renderedUnits bytes=${accessUnit.size} flags=$flags")
+                }
+            } else if (inputBuffer != null) {
+                Log.w("TaskbarH264", "drop oversized access unit bytes=${accessUnit.size} capacity=${inputBuffer.capacity()}")
+            }
+        }
+        fun flushPendingFrame() {
+            if (pendingFrameNals.isEmpty()) return
+            val isKeyFrame = pendingFrameNals.any { AnnexBNalParser.nalType(it) == 5 }
+            val hasVcl = pendingFrameNals.any { AnnexBNalParser.nalType(it) == 1 || AnnexBNalParser.nalType(it) == 5 }
+            if (!hasVcl) {
+                pendingFrameNals.clear()
+                return
+            }
+            if (isKeyFrame) seenKeyFrame = true
+            if (!seenKeyFrame) {
+                pendingFrameNals.clear()
+                return
+            }
+            queueAccessUnit(joinNals(pendingFrameNals), if (isKeyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+            pendingFrameNals.clear()
+        }
+        try {
             frames.collect { chunk ->
                 parser.push(chunk).forEach { nal ->
-                    drainOutput()
-                    var inputIndex = codec.dequeueInputBuffer(20_000)
-                    var attempts = 0
-                    while (inputIndex < 0 && attempts < 4) {
-                        drainOutput()
-                        inputIndex = codec.dequeueInputBuffer(20_000)
-                        attempts++
-                    }
-                    if (inputIndex < 0) return@forEach
-                    val inputBuffer = codec.getInputBuffer(inputIndex)
-                    inputBuffer?.clear()
-                    if (inputBuffer != null && nal.size <= inputBuffer.capacity()) {
-                        inputBuffer.put(nal)
-                        codec.queueInputBuffer(inputIndex, 0, nal.size, ptsUs, 0)
-                        ptsUs += 16_666L
+                    when (val type = AnnexBNalParser.nalType(nal)) {
+                        -1 -> Unit
+                        7 -> {
+                            flushPendingFrame()
+                            sps = nal
+                            configureDecoderIfReady()
+                        }
+                        8 -> {
+                            flushPendingFrame()
+                            pps = nal
+                            configureDecoderIfReady()
+                        }
+                        1, 5 -> {
+                            if (pendingFrameNals.any { AnnexBNalParser.nalType(it) == 1 || AnnexBNalParser.nalType(it) == 5 }) {
+                                flushPendingFrame()
+                            }
+                            pendingFrameNals.add(nal)
+                            observedNals++
+                            if (observedNals <= 24) {
+                                Log.i("TaskbarH264", "nal type=$type bytes=${nal.size}")
+                            }
+                        }
+                        6, 9 -> {
+                            if (type == 9) {
+                                flushPendingFrame()
+                            }
+                            pendingFrameNals.add(nal)
+                            observedNals++
+                            if (observedNals <= 24) {
+                                Log.i("TaskbarH264", "nal type=$type bytes=${nal.size}")
+                            }
+                        }
+                        else -> {
+                            if (pendingFrameNals.isNotEmpty()) pendingFrameNals.add(nal)
+                            observedNals++
+                            if (observedNals <= 24) {
+                                Log.i("TaskbarH264", "nal type=$type bytes=${nal.size}")
+                            }
+                        }
                     }
                     drainOutput()
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("TaskbarH264", "decoder failed", e)
         } finally {
-            runCatching { codec.stop() }
-            runCatching { codec.release() }
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
         }
     }
 
@@ -1295,14 +1439,28 @@ private class AnnexBNalParser {
         buffer += chunk
         val starts = findStartCodes(buffer)
         if (starts.size < 2) return emptyList()
-        val out = ArrayList<ByteArray>(starts.size - 1)
+        val out = ArrayList<ByteArray>()
         for (i in 0 until starts.lastIndex) {
             val start = starts[i]
             val end = starts[i + 1]
-            if (end > start) out.add(buffer.copyOfRange(start, end))
+            if (end > start) {
+                out.add(buffer.copyOfRange(start, end))
+            }
         }
         buffer = buffer.copyOfRange(starts.last(), buffer.size)
         return out
+    }
+
+    companion object {
+        fun nalType(nal: ByteArray): Int {
+            val offset = startCodeLength(nal)
+            return if (offset in nal.indices) nal[offset].toInt() and 0x1f else -1
+        }
+
+        private fun startCodeLength(nal: ByteArray): Int =
+            if (nal.size >= 4 && nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 0.toByte() && nal[3] == 1.toByte()) 4
+            else if (nal.size >= 3 && nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 1.toByte()) 3
+            else 0
     }
 
     private fun findStartCodes(data: ByteArray): List<Int> {
@@ -1321,4 +1479,15 @@ private class AnnexBNalParser {
         }
         return result
     }
+}
+
+private fun joinNals(nals: List<ByteArray>): ByteArray {
+    val size = nals.sumOf { it.size }
+    val joined = ByteArray(size)
+    var offset = 0
+    nals.forEach { nal ->
+        nal.copyInto(joined, offset)
+        offset += nal.size
+    }
+    return joined
 }

@@ -21,9 +21,11 @@ import io.ktor.serialization.kotlinx.json.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.isActive
@@ -33,7 +35,15 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import kotlin.math.roundToLong
 
-data class H264VideoConfig(val width: Int, val height: Int)
+data class H264VideoConfig(val width: Int, val height: Int, val fps: Int = 60)
+
+data class TouchPointInput(
+    val id: Int,
+    val action: String,
+    val x: Float,
+    val y: Float,
+    val primary: Boolean = false
+)
 
 class TaskbarViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsManager = SettingsManager(application)
@@ -67,7 +77,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _password = mutableStateOf("")
     val password: State<String> = _password
 
-    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, 2000, false, 18))
+    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, 2000, false, 18))
     val theme: State<ThemeSettings> = _theme
 
     private val _layoutMode = mutableStateOf("grid")
@@ -121,14 +131,15 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         viewModelScope.launch {
-            settingsManager.pcIp.collectLatest { ip ->
+            combine(settingsManager.pcIp, settingsManager.password) { ip, password -> ip to password }
+                .collectLatest { (ip, password) ->
                 _pcIp.value = ip
+                _password.value = password
                 if (ip.isNotEmpty() && connectionJob?.isActive != true) {
                     connect(ip)
                 }
             }
         }
-        viewModelScope.launch { settingsManager.password.collectLatest { _password.value = it } }
         viewModelScope.launch { settingsManager.themeSettings.collectLatest { _theme.value = it } }
         viewModelScope.launch { settingsManager.layoutMode.collectLatest { _layoutMode.value = it } }
         viewModelScope.launch { settingsManager.gridColumns.collectLatest { _gridColumns.value = it } }
@@ -212,7 +223,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             try {
                 val streamSettings = _theme.value
                 applyBackendStreamConfig(streamSettings, ip)
-                val livePath = if (streamSettings.useHardwareEncoding) "live_h264" else "live"
+                val livePath = if (streamSettings.useHighPerformanceWindowStreaming) "live_h264" else "live"
                 val liveUrl = "ws://$ip:8000/$livePath/$hwnd" +
                     "?max_dim=${streamSettings.streamMaxDim}" +
                     "&quality=${streamSettings.streamQuality}" +
@@ -231,7 +242,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                 if (receivedFrames == 1 || receivedFrames % 60 == 0) {
                                     Log.i("TaskbarLive", "Received binary frame count=$receivedFrames bytes=${bytes.size}")
                                 }
-                                if (streamSettings.useHardwareEncoding) {
+                                if (streamSettings.useHighPerformanceWindowStreaming) {
                                     _h264Frames.tryEmit(bytes)
                                 } else {
                                     val now = android.os.SystemClock.uptimeMillis()
@@ -248,9 +259,10 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                 if (parsed?.get("type")?.jsonPrimitive?.content == "video_config") {
                                     val width = parsed["width"]?.jsonPrimitive?.intOrNull ?: 0
                                     val height = parsed["height"]?.jsonPrimitive?.intOrNull ?: 0
+                                    val fps = parsed["fps"]?.jsonPrimitive?.intOrNull ?: 60
                                     if (width > 0 && height > 0) {
                                         _h264Error.value = null
-                                        _h264VideoConfig.value = H264VideoConfig(width, height)
+                                        _h264VideoConfig.value = H264VideoConfig(width, height, fps)
                                     }
                                 } else if (parsed?.get("type")?.jsonPrimitive?.content == "error") {
                                     val message = parsed["message"]?.jsonPrimitive?.content ?: "Hardware stream failed"
@@ -264,6 +276,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                         }
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e("TaskbarViewModel", "Live stream failed", e)
             }
@@ -304,6 +318,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                         }
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e("TaskbarInput", "Remote input failed", e)
                 _inputStatus.value = "Input connection failed: ${e.message ?: e::class.java.simpleName}"
@@ -341,6 +357,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                         }
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e("TaskbarInput", "Screen input failed", e)
                 _inputStatus.value = "Input connection failed: ${e.message ?: e::class.java.simpleName}"
@@ -412,6 +430,24 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             put("action", action)
             put("x", x.coerceIn(0f, 1f))
             put("y", y.coerceIn(0f, 1f))
+        })
+    }
+
+    fun sendMultiTouchInput(points: List<TouchPointInput>) {
+        if (points.isEmpty()) return
+        sendRemoteInput(buildJsonObject {
+            put("type", "touch_multi")
+            putJsonArray("points") {
+                points.forEach { point ->
+                    add(buildJsonObject {
+                        put("id", point.id.coerceIn(0, 9))
+                        put("action", point.action)
+                        put("x", point.x.coerceIn(0f, 1f))
+                        put("y", point.y.coerceIn(0f, 1f))
+                        put("primary", point.primary)
+                    })
+                }
+            }
         })
     }
 
@@ -561,7 +597,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             try {
                 val streamSettings = _theme.value
                 applyBackendStreamConfig(streamSettings, ip)
-                val livePath = if (streamSettings.useHardwareEncoding) "live_h264/screen" else "live/screen"
+                val useScreenHardware = streamSettings.useHardwareEncoding
+                val livePath = if (useScreenHardware) "live_h264/screen" else "live/screen"
                 val liveUrl = "ws://$ip:8000/$livePath/$monitorIndex" +
                     "?max_dim=${streamSettings.streamMaxDim}" +
                     "&quality=${streamSettings.streamQuality}" +
@@ -573,7 +610,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                     for (frame in incoming) {
                         if (frame is Frame.Binary) {
                             val bytes = frame.readBytes()
-                            if (streamSettings.useHardwareEncoding) {
+                            if (useScreenHardware) {
                                 _h264Frames.tryEmit(bytes)
                             } else {
                                 val now = android.os.SystemClock.uptimeMillis()
@@ -589,9 +626,10 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                             if (parsed?.get("type")?.jsonPrimitive?.content == "video_config") {
                                 val width = parsed["width"]?.jsonPrimitive?.intOrNull ?: 0
                                 val height = parsed["height"]?.jsonPrimitive?.intOrNull ?: 0
+                                val fps = parsed["fps"]?.jsonPrimitive?.intOrNull ?: 60
                                 if (width > 0 && height > 0) {
                                     _h264Error.value = null
-                                    _h264VideoConfig.value = H264VideoConfig(width, height)
+                                    _h264VideoConfig.value = H264VideoConfig(width, height, fps)
                                 }
                             } else if (parsed?.get("type")?.jsonPrimitive?.content == "error") {
                                 val message = parsed["message"]?.jsonPrimitive?.content ?: "Hardware stream failed"
@@ -601,6 +639,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                         }
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e("TaskbarViewModel", "Screen stream failed", e)
             }

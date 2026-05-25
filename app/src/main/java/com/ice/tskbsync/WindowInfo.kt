@@ -18,6 +18,7 @@ data class WindowInfo(
 @Serializable
 data class ScreenInfo(
     val monitor_index: Int = 0,
+    val ddagrab_output_idx: Int = 0,
     val left: Int = 0,
     val top: Int = 0,
     val right: Int = 0,
@@ -45,6 +46,11 @@ data class H264StatusInfo(
     val selected_profile: String = "",
     val usable: Boolean = false,
     val message: String = "",
+    val native_streamer_path: String = "",
+    val native_screen_capture: Boolean = false,
+    val native_screen_message: String = "",
+    val direct_screen_capture: Boolean = false,
+    val direct_screen_message: String = "",
     val results: List<H264EncoderProbe> = emptyList(),
     val lookup_order: List<String> = emptyList()
 )

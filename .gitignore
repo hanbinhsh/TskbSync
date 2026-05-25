@@ -20,3 +20,5 @@ pc_backend/logs/
 pc_backend/ffmpeg_path.txt
 pc_backend/bin/ffmpeg.exe
 pc_backend/bin/ffprobe.exe
+pc_backend/bin/tskbsync_native_streamer.exe
+pc_backend/native_streamer/build/

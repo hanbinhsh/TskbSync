@@ -153,8 +153,8 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         Slider(
                                             value = gridCols.toFloat(),
                                             onValueChange = { viewModel.updateDisplaySettings(it.toInt(), showTitles) },
-                                            valueRange = 2f..6f,
-                                            steps = 3,
+                                            valueRange = 2f..12f,
+                                            steps = 9,
                                             modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
                                         )
                                     }
@@ -187,10 +187,17 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         viewModel.updateTheme(theme.copy(streamFps = it))
                                     }
                                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("Hardware H.264 Encoding", modifier = Modifier.weight(1f))
+                                        Text("Use Hardware Encoding for Screen Streaming", modifier = Modifier.weight(1f))
                                         Switch(
                                             checked = theme.useHardwareEncoding,
                                             onCheckedChange = { viewModel.updateTheme(theme.copy(useHardwareEncoding = it)) }
+                                        )
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Text("High Performance Window Streaming", modifier = Modifier.weight(1f))
+                                        Switch(
+                                            checked = theme.useHighPerformanceWindowStreaming,
+                                            onCheckedChange = { viewModel.updateTheme(theme.copy(useHighPerformanceWindowStreaming = it)) }
                                         )
                                     }
                                     H264StatusPanel(
@@ -556,6 +563,20 @@ fun H264StatusPanel(
                     text = "FFmpeg: ${status.ffmpeg_path.ifEmpty { "Not found" }}",
                     style = MaterialTheme.typography.bodySmall,
                     fontSize = 11.sp
+                )
+                Text(
+                    text = "Native streamer: ${if (status.native_screen_capture) "Available" else "Unavailable"}" +
+                        if (status.native_screen_message.isBlank()) "" else " - ${status.native_screen_message.lineSequence().firstOrNull().orEmpty()}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontSize = 11.sp,
+                    maxLines = 2
+                )
+                Text(
+                    text = "Direct screen capture: ${if (status.direct_screen_capture) "Available" else "Unavailable"}" +
+                        if (status.direct_screen_message.isBlank()) "" else " - ${status.direct_screen_message.lineSequence().firstOrNull().orEmpty()}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontSize = 11.sp,
+                    maxLines = 2
                 )
                 if (status.message.isNotBlank()) {
                     Text(
