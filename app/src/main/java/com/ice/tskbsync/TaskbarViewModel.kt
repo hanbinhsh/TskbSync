@@ -28,6 +28,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import kotlin.math.roundToLong
 
 class TaskbarViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsManager = SettingsManager(application)
@@ -102,9 +103,18 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private var activeWsSession: DefaultClientWebSocketSession? = null
     val discoveredServers = mutableStateListOf<String>()
     private var isDiscovering = false
+    private val reconnectBaseDelayMs = 1500L
+    private val reconnectMaxDelayMs = 8000L
 
     init {
-        viewModelScope.launch { settingsManager.pcIp.collectLatest { _pcIp.value = it } }
+        viewModelScope.launch {
+            settingsManager.pcIp.collectLatest { ip ->
+                _pcIp.value = ip
+                if (ip.isNotEmpty() && connectionJob?.isActive != true) {
+                    connect(ip)
+                }
+            }
+        }
         viewModelScope.launch { settingsManager.password.collectLatest { _password.value = it } }
         viewModelScope.launch { settingsManager.themeSettings.collectLatest { _theme.value = it } }
         viewModelScope.launch { settingsManager.layoutMode.collectLatest { _layoutMode.value = it } }
@@ -112,11 +122,6 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { settingsManager.showTitles.collectLatest { _showTitles.value = it } }
         viewModelScope.launch { settingsManager.shortcuts.collectLatest { _shortcuts.value = it } }
         viewModelScope.launch { settingsManager.windowFilter.collectLatest { _windowFilter.value = it } }
-
-        viewModelScope.launch {
-            delay(1500)
-            if (_pcIp.value.isNotEmpty()) connect(_pcIp.value)
-        }
     }
 
     fun connect(ip: String) {
@@ -124,49 +129,59 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         _error.value = null
         val pass = _password.value
         connectionJob = viewModelScope.launch {
-            try {
-                applyBackendStreamConfig(_theme.value, ip)
-                applyGridPreviewConfig(_theme.value, ip)
-                applyWindowFilterConfig(_windowFilter.value, ip)
-                client.webSocket("ws://$ip:8000/ws") {
-                    activeWsSession = this
-                    send(Frame.Text(pass))
-                    _isConnected.value = true
+            var reconnectDelay = reconnectBaseDelayMs
+            while (isActive) {
+                try {
+                    applyBackendStreamConfig(_theme.value, ip)
+                    applyGridPreviewConfig(_theme.value, ip)
+                    applyWindowFilterConfig(_windowFilter.value, ip)
+                    client.webSocket("ws://$ip:8000/ws") {
+                        activeWsSession = this
+                        send(Frame.Text(pass))
+                        _isConnected.value = true
+                        _error.value = null
+                        reconnectDelay = reconnectBaseDelayMs
 
-                    for (frame in incoming) {
-                        if (frame is Frame.Text) {
-                            val text = frame.readText()
-                            if (text.startsWith("error:")) {
-                                _error.value = text.substringAfter("error: "); break
-                            }
-                            if (text == "pong") continue
-
-                            try {
-                                val json = Json.parseToJsonElement(text).jsonObject
-                                when (json["type"]?.jsonPrimitive?.content) {
-                                    "list" -> {
-                                        val list = Json.decodeFromJsonElement<List<WindowInfo>>(json["data"]!!)
-                                        _windows.value = list
-                                        _lastSyncTime.value = System.currentTimeMillis()
-                                    }
-                                    "grid_previews" -> {
-                                        val data = json["data"]?.jsonObject ?: return@webSocket
-                                        data.forEach { (hwnd, b64) ->
-                                            gridPreviewCache[hwnd.toLong()] = b64.jsonPrimitive.content
-                                        }
-                                        _lastSyncTime.value = System.currentTimeMillis()
-                                    }
+                        for (frame in incoming) {
+                            if (frame is Frame.Text) {
+                                val text = frame.readText()
+                                if (text.startsWith("error:")) {
+                                    _error.value = text.substringAfter("error: ")
+                                    break
                                 }
-                            } catch (e: Exception) { }
+                                if (text == "pong") continue
+
+                                try {
+                                    val json = Json.parseToJsonElement(text).jsonObject
+                                    when (json["type"]?.jsonPrimitive?.content) {
+                                        "list" -> {
+                                            val list = Json.decodeFromJsonElement<List<WindowInfo>>(json["data"]!!)
+                                            _windows.value = list
+                                            _lastSyncTime.value = System.currentTimeMillis()
+                                        }
+                                        "grid_previews" -> {
+                                            val data = json["data"]?.jsonObject ?: return@webSocket
+                                            data.forEach { (hwnd, b64) ->
+                                                gridPreviewCache[hwnd.toLong()] = b64.jsonPrimitive.content
+                                            }
+                                            _lastSyncTime.value = System.currentTimeMillis()
+                                        }
+                                    }
+                                } catch (e: Exception) { }
+                            }
                         }
                     }
+                } catch (e: Exception) {
+                    _error.value = "Connection failed: ${e.localizedMessage}"
+                } finally {
+                    _isConnected.value = false
+                    _windows.value = emptyList()
+                    activeWsSession = null
                 }
-            } catch (e: Exception) {
-                _error.value = "Connection failed: ${e.localizedMessage}"
-            } finally {
-                _isConnected.value = false
-                _windows.value = emptyList()
-                activeWsSession = null
+
+                if (!isActive) break
+                delay(reconnectDelay)
+                reconnectDelay = (reconnectDelay * 2).coerceAtMost(reconnectMaxDelayMs)
             }
         }
     }
@@ -188,6 +203,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                     "&fps=${streamSettings.streamFps}"
                 Log.i("TaskbarLive", "Connecting live stream: $liveUrl")
                 var receivedFrames = 0
+                var lastPublishedAt = 0L
+                val publishIntervalMs = (1000f / streamSettings.streamFps.coerceIn(1, 120)).roundToLong().coerceAtLeast(1L)
                 client.webSocket(liveUrl) {
                     Log.i("TaskbarLive", "Live stream connected: hwnd=$hwnd")
                     for (frame in incoming) {
@@ -198,7 +215,11 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                 if (receivedFrames == 1 || receivedFrames % 60 == 0) {
                                     Log.i("TaskbarLive", "Received binary frame count=$receivedFrames bytes=${bytes.size}")
                                 }
-                                _focusedLiveFrame.value = bytes
+                                val now = android.os.SystemClock.uptimeMillis()
+                                if (now - lastPublishedAt >= publishIntervalMs) {
+                                    lastPublishedAt = now
+                                    _focusedLiveFrame.value = bytes
+                                }
                             }
                             is Frame.Text -> {
                                 val text = frame.readText()
@@ -489,10 +510,17 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                     "&quality=${streamSettings.streamQuality}" +
                     "&fps=${streamSettings.streamFps}"
                 Log.i("TaskbarLive", "Connecting screen stream: $liveUrl")
+                var lastPublishedAt = 0L
+                val publishIntervalMs = (1000f / streamSettings.streamFps.coerceIn(1, 120)).roundToLong().coerceAtLeast(1L)
                 client.webSocket(liveUrl) {
                     for (frame in incoming) {
                         if (frame is Frame.Binary) {
-                            _focusedLiveFrame.value = frame.readBytes()
+                            val bytes = frame.readBytes()
+                            val now = android.os.SystemClock.uptimeMillis()
+                            if (now - lastPublishedAt >= publishIntervalMs) {
+                                lastPublishedAt = now
+                                _focusedLiveFrame.value = bytes
+                            }
                         } else if (frame is Frame.Text) {
                             Log.i("TaskbarLive", frame.readText())
                         }
@@ -559,5 +587,31 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    override fun onCleared() { super.onCleared(); client.close() }
+    fun controlWindow(hwnd: Long, action: String, monitorIndex: Int? = null) {
+        viewModelScope.launch {
+            val ip = _pcIp.value
+            if (ip.isEmpty() || hwnd == 0L) return@launch
+            try {
+                client.post("http://$ip:8000/window/$hwnd/control") {
+                    header("password", _password.value)
+                    contentType(ContentType.Application.Json)
+                    setBody(buildJsonObject {
+                        put("action", action)
+                        if (monitorIndex != null) put("monitor_index", monitorIndex)
+                    }.toString())
+                }
+            } catch (e: Exception) {
+                Log.e("TaskbarViewModel", "Window control failed", e)
+                _inputStatus.value = "Window control failed: ${e.localizedMessage}"
+            }
+        }
+    }
+
+    override fun onCleared() {
+        connectionJob?.cancel()
+        liveStreamJob?.cancel()
+        inputJob?.cancel()
+        super.onCleared()
+        client.close()
+    }
 }

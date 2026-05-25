@@ -79,19 +79,9 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
             var selectedTab by remember { mutableIntStateOf(0) }
             val tabs = listOf("Connection", "Display", "Appearance", "Shortcuts")
 
-            Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-                TabRow(selectedTabIndex = selectedTab) {
-                    tabs.forEachIndexed { index, label ->
-                        Tab(
-                            selected = selectedTab == index,
-                            onClick = { selectedTab = index },
-                            text = { Text(label) }
-                        )
-                    }
-                }
-
+            val settingsContent: @Composable (Modifier) -> Unit = { contentModifier ->
                 LazyColumn(
-                    modifier = Modifier.fillMaxSize().padding(16.dp),
+                    modifier = contentModifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     when (selectedTab) {
@@ -182,13 +172,13 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         viewModel.updateTheme(theme.copy(livePreviewCornerPx = it))
                                     }
                                     HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-                                    StreamSlider("Stream Resolution", theme.streamMaxDim, "p", 360f..1440f, 8) {
+                                    StreamSlider("Stream Resolution", theme.streamMaxDim, "p", 360f..3840f, 28) {
                                         viewModel.updateTheme(theme.copy(streamMaxDim = it))
                                     }
-                                    StreamSlider("Stream Quality", theme.streamQuality, "%", 35f..95f, 11) {
+                                    StreamSlider("Stream Quality", theme.streamQuality, "%", 35f..100f, 12) {
                                         viewModel.updateTheme(theme.copy(streamQuality = it))
                                     }
-                                    StreamSlider("Stream FPS", theme.streamFps, " fps", 5f..60f, 10) {
+                                    StreamSlider("Stream FPS", theme.streamFps, " fps", 5f..160f, 30) {
                                         viewModel.updateTheme(theme.copy(streamFps = it))
                                     }
                                     StreamSlider("Grid Refresh", theme.gridPreviewIntervalMs, " ms", 500f..3000f, 24) {
@@ -375,6 +365,35 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            BoxWithConstraints(modifier = Modifier.fillMaxSize().padding(padding)) {
+                if (maxWidth > maxHeight) {
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        SettingsSideTabs(
+                            tabs = tabs,
+                            selectedTab = selectedTab,
+                            onSelected = { selectedTab = it },
+                            color = themeColor,
+                            modifier = Modifier.fillMaxHeight().width(176.dp)
+                        )
+                        VerticalDivider()
+                        settingsContent(Modifier.weight(1f).fillMaxHeight())
+                    }
+                } else {
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        TabRow(selectedTabIndex = selectedTab) {
+                            tabs.forEachIndexed { index, label ->
+                                Tab(
+                                    selected = selectedTab == index,
+                                    onClick = { selectedTab = index },
+                                    text = { Text(label) }
+                                )
+                            }
+                        }
+                        settingsContent(Modifier.fillMaxSize())
                     }
                 }
             }
@@ -572,4 +591,43 @@ fun SectionTitle(title: String, color: Color) {
         color = color,
         modifier = Modifier.padding(bottom = 8.dp, top = 8.dp)
     )
+}
+
+@Composable
+fun SettingsSideTabs(
+    tabs: List<String>,
+    selectedTab: Int,
+    onSelected: (Int) -> Unit,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier.padding(horizontal = 10.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        tabs.forEachIndexed { index, label ->
+            val selected = selectedTab == index
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = if (selected) color.copy(alpha = 0.16f) else Color.Transparent,
+                contentColor = if (selected) color else MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .clickable { onSelected(index) }
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = label,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+    }
 }

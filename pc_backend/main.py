@@ -178,6 +178,12 @@ def should_filter_window(title, process_name, class_name):
         return True
     return False
 
+def is_window_maximized(hwnd: int):
+    try:
+        return win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMAXIMIZED
+    except Exception:
+        return False
+
 def get_windows_list_minimal():
     windows = []
     foreground_hwnd = win32gui.GetForegroundWindow()
@@ -195,6 +201,7 @@ def get_windows_list_minimal():
             "icon": get_window_best_icon(h),
             "preview": "",
             "is_active": (h == foreground_hwnd),
+            "is_maximized": is_window_maximized(h),
             "pid": pid,
             "process_name": process_name,
             "class_name": class_name
@@ -214,6 +221,7 @@ LIVE_TARGET_FPS = 30.0
 GRID_PREVIEW_INTERVAL = 5.0
 current_obs_hwnd = 0
 connected_clients = set()
+active_live_streams = 0
 DEFAULT_SYSTEM_TITLE_FILTERS = [
     "Windows 输入体验",
     "Windows Input Experience",
@@ -409,6 +417,15 @@ def get_window_screen_point(hwnd: int, x: float, y: float):
     ny = max(0.0, min(float(y), 1.0))
     return int(rect.left + nx * width), int(rect.top + ny * height)
 
+def get_window_bounds(hwnd: int):
+    DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    rect = wintypes.RECT()
+    try:
+        dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
+        return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+    except Exception:
+        return tuple(map(int, win32gui.GetWindowRect(hwnd)))
+
 def get_screens_list():
     screens = []
     try:
@@ -448,6 +465,42 @@ def get_screen_rect(monitor_index: int):
         if int(screen["monitor_index"]) == int(monitor_index):
             return screen
     raise RuntimeError(f"screen not found: {monitor_index}")
+
+def move_window_to_screen(hwnd: int, monitor_index: int):
+    screen = get_screen_rect(monitor_index)
+    if win32gui.IsIconic(hwnd) or is_window_maximized(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        time.sleep(0.05)
+
+    left, top, right, bottom = get_window_bounds(hwnd)
+    width = max(120, right - left)
+    height = max(80, bottom - top)
+    work_left = int(screen.get("work_left", screen["left"]))
+    work_top = int(screen.get("work_top", screen["top"]))
+    work_right = int(screen.get("work_right", screen["right"]))
+    work_bottom = int(screen.get("work_bottom", screen["bottom"]))
+    work_width = max(1, work_right - work_left)
+    work_height = max(1, work_bottom - work_top)
+    target_width = min(width, work_width)
+    target_height = min(height, work_height)
+    target_left = work_left + max(0, (work_width - target_width) // 2)
+    target_top = work_top + max(0, (work_height - target_height) // 2)
+    win32gui.SetWindowPos(
+        hwnd,
+        None,
+        target_left,
+        target_top,
+        target_width,
+        target_height,
+        win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE,
+    )
+    return {
+        "left": target_left,
+        "top": target_top,
+        "width": target_width,
+        "height": target_height,
+        "monitor_index": monitor_index,
+    }
 
 def get_screen_point(monitor_index: int, x: float, y: float):
     screen = get_screen_rect(monitor_index)
@@ -671,14 +724,52 @@ async def switch_window(hwnd: int, request: Request):
     win32api.keybd_event(win32con.VK_MENU, 0, 0, 0); win32gui.SetForegroundWindow(hwnd); win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
     return {"status": "success"}
 
+@app.post("/window/{hwnd}/control")
+async def control_window(hwnd: int, request: Request):
+    if request.headers.get("password") != PASSWORD:
+        return JSONResponse(status_code=401, content={"message": "Invalid password"})
+    if not win32gui.IsWindow(hwnd):
+        raise HTTPException(status_code=404, detail="window not found")
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    action = str(data.get("action", "")).strip().lower()
+
+    try:
+        result = None
+        if action == "close":
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        elif action == "minimize":
+            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        elif action == "maximize":
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+        elif action == "restore":
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        elif action == "move_to_screen":
+            monitor_index = int(data.get("monitor_index", 0))
+            if monitor_index <= 0:
+                raise HTTPException(status_code=400, detail="monitor_index is required")
+            result = move_window_to_screen(hwnd, monitor_index)
+        else:
+            raise HTTPException(status_code=400, detail="unsupported action")
+        return {"status": "success", "action": action, "hwnd": hwnd, "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"{type(e).__name__}: {e}")
+
 @app.post("/config/wgc")
 async def set_wgc(enabled: bool = True, max_dim: int = 720, quality: int = 72, fps: int = 30):
     global USE_WGC, WGC_REQUESTED, LIVE_MAX_DIM, LIVE_JPEG_QUALITY, LIVE_TARGET_FPS
     WGC_REQUESTED = True
     USE_WGC = WGC_AVAILABLE
-    LIVE_MAX_DIM = float(max(360, min(max_dim, 1440)))
-    LIVE_JPEG_QUALITY = max(35, min(quality, 95))
-    LIVE_TARGET_FPS = float(max(5, min(fps, 60)))
+    LIVE_MAX_DIM = float(max(360, min(max_dim, 3840)))
+    LIVE_JPEG_QUALITY = max(35, min(quality, 100))
+    LIVE_TARGET_FPS = float(max(5, min(fps, 160)))
     return {
         "use_wgc": USE_WGC,
         "wgc_requested": WGC_REQUESTED,
@@ -820,7 +911,10 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg.startswith("observe:"):
                 global current_obs_hwnd; current_obs_hwnd = int(msg.split(":")[1])
             elif msg == "ping": await websocket.send_text("pong")
-    except: pass
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[ws] failed: {type(e).__name__}: {e}", flush=True)
     finally: connected_clients.discard(websocket)
 
 
@@ -832,14 +926,16 @@ async def live_stream_endpoint(
     quality: int | None = None,
     fps: int | None = None
 ):
+    global active_live_streams
     await websocket.accept()
     capture = None
     capture_control = None
+    active_live_streams += 1
     try:
         stream_use_wgc = True
-        stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 1440)))
-        stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 95))
-        stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 60)))
+        stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 3840)))
+        stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 100))
+        stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 160)))
 
         if not WGC_AVAILABLE:
             print(f"[live] hwnd={hwnd} requested WGC but windows_capture is unavailable", flush=True)
@@ -931,6 +1027,7 @@ async def live_stream_endpoint(
         # 【修复4】：将 except: 改为 except Exception: ，绝不吞噬系统级退出信号
         print(f"[live] stream failed hwnd={hwnd}: {type(e).__name__}: {e}", flush=True)
     finally:
+        active_live_streams = max(0, active_live_streams - 1)
         if capture_control:
             try: 
                 capture_control.stop()
@@ -946,17 +1043,19 @@ async def live_screen_stream_endpoint(
     quality: int | None = None,
     fps: int | None = None
 ):
+    global active_live_streams
     await websocket.accept()
     capture = None
     capture_control = None
+    active_live_streams += 1
     try:
         if not WGC_AVAILABLE:
             await safe_close(websocket)
             return
         _ = get_screen_rect(monitor_index)
-        stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 2160)))
-        stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 95))
-        stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 60)))
+        stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 3840)))
+        stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 100))
+        stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 160)))
         print(f"[live] start WGC screen={monitor_index} max_dim={stream_max_dim:.0f} quality={stream_quality} fps={stream_fps:.0f}", flush=True)
         capture = WindowsCapture(monitor_index=monitor_index, draw_border=False)
         wgc_buffer = collections.deque(maxlen=1)
@@ -1003,6 +1102,7 @@ async def live_screen_stream_endpoint(
     except Exception as e:
         print(f"[live] screen stream failed monitor={monitor_index}: {type(e).__name__}: {e}", flush=True)
     finally:
+        active_live_streams = max(0, active_live_streams - 1)
         if capture_control:
             try:
                 capture_control.stop()
@@ -1022,7 +1122,7 @@ async def list_broadcaster():
                 if curr_hash != last_hash:
                     last_hash = curr_hash
                     for ws in list(connected_clients): await ws.send_text(data_json)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(5.0 if active_live_streams else 1.5)
         except asyncio.CancelledError: break  # 关键修复！退出时安静结束任务
         except Exception: await asyncio.sleep(1.5)
 
@@ -1036,7 +1136,7 @@ async def grid_preview_broadcaster():
 
     while True:
         try:
-            if connected_clients:
+            if connected_clients and active_live_streams == 0:
                 previews = await asyncio.to_thread(fetch_grid_previews)
                 if previews:
                     msg = json.dumps({"type": "grid_previews", "data": previews})

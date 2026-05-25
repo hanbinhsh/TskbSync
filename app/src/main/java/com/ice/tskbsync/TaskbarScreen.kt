@@ -1,7 +1,6 @@
 package com.ice.tskbsync
 
 import android.graphics.BitmapFactory
-import android.util.Log
 import android.util.Base64
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
@@ -66,6 +65,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.collectLatest
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.runtime.snapshotFlow
 import android.graphics.Bitmap
@@ -86,6 +86,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val showTitles by viewModel.showTitles
     val lastSyncTime by viewModel.lastSyncTime
     val inputStatus by viewModel.inputStatus
+    val screens by viewModel.screens
 
     val accentColor = Color(theme.color)
     val titleColor = Color(theme.titleColor)
@@ -94,6 +95,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val bgColor = lerp(MaterialTheme.colorScheme.surface, accentColor, 0.1f)
     var isLandscapeSingleMode by remember { mutableStateOf(false) }
     var showLandscapeShortcutBar by remember { mutableStateOf(false) }
+    var showWindowControlBar by remember { mutableStateOf(false) }
     var landscapeInputMode by remember { mutableStateOf("touch") }
     var rightPanelMode by remember { mutableStateOf<String?>(null) } // null/window list, "mouse", "screen"
     var selectedScreenIndex by remember { mutableStateOf<Int?>(null) }
@@ -102,6 +104,15 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val keyboardController = LocalSoftwareKeyboardController.current
     val coroutineScope = rememberCoroutineScope()
     val contentMode = if (isLandscapeSingleMode) "landscape" else layoutMode
+    val controlledWindow = windows.firstOrNull { it.hwnd == viewModel.selectedRowHwnd.value }
+        ?: windows.firstOrNull { it.is_active }
+        ?: windows.firstOrNull()
+
+    LaunchedEffect(isLandscapeSingleMode, layoutMode, theme.showPreviews) {
+        if (!theme.showPreviews || (!isLandscapeSingleMode && layoutMode == "grid")) {
+            viewModel.stopLiveStream()
+        }
+    }
 
     MaterialTheme(colorScheme = MaterialTheme.colorScheme.copy(primary = accentColor, onSurface = titleColor)) {
         Scaffold(
@@ -109,18 +120,78 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
             topBar = {
                 CenterAlignedTopAppBar(
                     navigationIcon = {
-                        if (isLandscapeSingleMode) {
-                            IconButton(onClick = { showLandscapeShortcutBar = !showLandscapeShortcutBar }) {
-                                Icon(
-                                    if (showLandscapeShortcutBar) Icons.Default.Close else Icons.Default.KeyboardCommandKey,
-                                    null,
-                                    tint = titleColor
-                                )
+                        if (showWindowControlBar) {
+                            IconButton(onClick = { showWindowControlBar = false }) {
+                                Icon(Icons.Default.Close, null, tint = titleColor)
+                            }
+                        } else {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(onClick = {
+                                    showWindowControlBar = true
+                                    showLandscapeShortcutBar = false
+                                    viewModel.fetchScreens()
+                                }) {
+                                    Icon(Icons.Default.OpenInNew, null, tint = titleColor)
+                                }
+                                if (isLandscapeSingleMode) {
+                                    IconButton(onClick = {
+                                        showLandscapeShortcutBar = !showLandscapeShortcutBar
+                                        if (showLandscapeShortcutBar) showWindowControlBar = false
+                                    }) {
+                                        Icon(
+                                            if (showLandscapeShortcutBar) Icons.Default.Close else Icons.Default.KeyboardCommandKey,
+                                            null,
+                                            tint = titleColor
+                                        )
+                                    }
+                                }
                             }
                         }
                     },
                     title = {
-                        if (isLandscapeSingleMode && showLandscapeShortcutBar) {
+                        if (showWindowControlBar) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState())
+                            ) {
+                                if (controlledWindow == null) {
+                                    AssistChip(
+                                        onClick = {},
+                                        label = { Text("No window", maxLines = 1) },
+                                        leadingIcon = { Icon(Icons.Default.Info, null, modifier = Modifier.size(18.dp)) }
+                                    )
+                                } else {
+                                    IconButton(onClick = { viewModel.controlWindow(controlledWindow.hwnd, "close") }) {
+                                        Icon(Icons.Default.Close, null, tint = titleColor)
+                                    }
+                                    IconButton(onClick = { viewModel.controlWindow(controlledWindow.hwnd, "minimize") }) {
+                                        Icon(Icons.Default.Minimize, null, tint = titleColor)
+                                    }
+                                    IconButton(onClick = {
+                                        viewModel.controlWindow(
+                                            controlledWindow.hwnd,
+                                            if (controlledWindow.is_maximized) "restore" else "maximize"
+                                        )
+                                    }) {
+                                        Icon(
+                                            if (controlledWindow.is_maximized) Icons.Default.CloseFullscreen else Icons.Default.OpenInFull,
+                                            null,
+                                            tint = titleColor
+                                        )
+                                    }
+                                    screens.forEach { screen ->
+                                        AssistChip(
+                                            onClick = { viewModel.controlWindow(controlledWindow.hwnd, "move_to_screen", screen.monitor_index) },
+                                            label = { Text("Display ${screen.monitor_index}", maxLines = 1) },
+                                            leadingIcon = { Icon(Icons.Default.StayCurrentLandscape, null, modifier = Modifier.size(18.dp)) }
+                                        )
+                                    }
+                                }
+                            }
+                        } else if (isLandscapeSingleMode && showLandscapeShortcutBar) {
                             Row(
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -163,7 +234,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                         }
                     },
                     actions = {
-                        if (!showLandscapeShortcutBar) {
+                        if (!showLandscapeShortcutBar && !showWindowControlBar) {
                             IconButton(onClick = { isLandscapeSingleMode = !isLandscapeSingleMode }) {
                                 Icon(
                                     if (isLandscapeSingleMode) Icons.Default.StayCurrentPortrait else Icons.Default.StayCurrentLandscape,
@@ -229,15 +300,8 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
 
                 if (isLandscapeSingleMode) {
                     BoxWithConstraints(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                        val portraitWidth = maxWidth
-                        val portraitHeight = maxHeight
-                        Box(
-                            modifier = Modifier
-                                .requiredWidth(portraitHeight)
-                                .requiredHeight(portraitWidth)
-                                .rotate(90f),
-                            contentAlignment = Alignment.Center
-                        ) {
+                        val isAlreadyLandscape = maxWidth > maxHeight
+                        val landscapeContent: @Composable BoxScope.() -> Unit = {
                             if (!isConnected) {
                                 ConnectionStatusPlaceholder(pcIp, error, titleColor) { viewModel.connect(pcIp) }
                             } else {
@@ -296,6 +360,22 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     }
                                 )
                             }
+                        }
+                        if (isAlreadyLandscape) {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center,
+                                content = landscapeContent
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .requiredWidth(maxHeight)
+                                    .requiredHeight(maxWidth)
+                                    .rotate(90f),
+                                contentAlignment = Alignment.Center,
+                                content = landscapeContent
+                            )
                         }
                     }
                 } else {
@@ -394,10 +474,10 @@ fun CarouselPagerMode(
     val itemSpacing = 8.dp
     val totalSlotWidth = itemWidth + itemSpacing
 
-    LaunchedEffect(pagerState.currentPage) {
+    LaunchedEffect(pagerState.currentPage, showPreviews) {
         val hwnd = windows.getOrNull(pagerState.currentPage)?.hwnd
         if (hwnd != null) onRowPageChange(hwnd)
-        onCenterChange(hwnd)
+        onCenterChange(if (showPreviews) hwnd else null)
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -408,8 +488,7 @@ fun CarouselPagerMode(
                 val previewShape = RoundedCornerShape(24.dp)
                 Box(
                     modifier = Modifier
-                        .fillMaxHeight()
-                        .aspectRatio(0.75f)
+                        .fillMaxSize()
                         .clip(previewShape)
                         .background(previewContainerColor)
                         .clickable { onSwitch(currentWindow.hwnd) }
@@ -521,11 +600,14 @@ fun LandscapeSingleMode(
     val currentWindow = windows.firstOrNull { it.hwnd == selectedRowHwnd }
         ?: windows.firstOrNull { it.is_active }
         ?: windows.first()
-    val liveFrameSize = rememberLiveFrameSize(focusedLiveFrame, currentWindow.hwnd)
+    val liveBitmapState = rememberLiveBitmapFrame(focusedLiveFrame, currentWindow.hwnd)
+    val liveFrameSize = liveBitmapState.value?.let { it.width to it.height }
 
-    LaunchedEffect(currentWindow.hwnd) {
+    LaunchedEffect(currentWindow.hwnd, showPreviews, rightPanelMode) {
         onRowPageChange(currentWindow.hwnd)
-        onCenterChange(currentWindow.hwnd)
+        if (rightPanelMode != "screen") {
+            onCenterChange(if (showPreviews) currentWindow.hwnd else null)
+        }
     }
 
     DisposableEffect(currentWindow.hwnd) {
@@ -621,7 +703,8 @@ fun LandscapeSingleMode(
                                     accentColor = accentColor,
                                     containerColor = previewContainerColor,
                                     clipPreview = clipLivePreview,
-                                    cornerPx = livePreviewCornerPx
+                                    cornerPx = livePreviewCornerPx,
+                                    decodedBitmap = liveBitmapState.value
                                 )
                             } else {
                                 IconContainer(
@@ -724,14 +807,13 @@ fun LandscapeSingleMode(
                     Column(
                         modifier = Modifier
                             .weight(1f)
-                            .fillMaxWidth()
-                            .verticalScroll(rememberScrollState()),
+                            .fillMaxWidth(),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                     if (rightPanelMode == "mouse") {
                         Column(
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.fillMaxSize(),
                             verticalArrangement = Arrangement.spacedBy(5.dp)
                         ) {
                             FilledTonalButton(
@@ -749,112 +831,123 @@ fun LandscapeSingleMode(
                                 contentPadding = PaddingValues(horizontal = 4.dp),
                                 modifier = Modifier.fillMaxWidth().height(34.dp)
                             ) { Text("Right", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Color.Black.copy(alpha = 0.12f))
+                                    .pointerInput(Unit) {
+                                        awaitEachGesture {
+                                            val down = awaitFirstDown()
+                                            var prevY = down.position.y
+                                            do {
+                                                val event = awaitPointerEvent()
+                                                val change = event.changes.firstOrNull() ?: break
+                                                val dy = change.position.y - prevY
+                                                if (kotlin.math.abs(dy) > 6f) {
+                                                    onMouseWheel(((-dy) * 1.2f).roundToInt().coerceIn(-120, 120))
+                                                    prevY = change.position.y
+                                                }
+                                                change.consume()
+                                            } while (event.changes.any { it.pressed })
+                                        }
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("Wheel", fontSize = 10.sp, color = titleColor.copy(alpha = 0.8f))
+                            }
                         }
-                        Box(
+                    } else {
+                        Column(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .height(132.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(Color.Black.copy(alpha = 0.12f))
-                                .pointerInput(Unit) {
-                                    awaitEachGesture {
-                                        val down = awaitFirstDown()
-                                        var prevY = down.position.y
-                                        do {
-                                            val event = awaitPointerEvent()
-                                            val change = event.changes.firstOrNull() ?: break
-                                            val dy = change.position.y - prevY
-                                            if (kotlin.math.abs(dy) > 6f) {
-                                                onMouseWheel(((-dy) * 1.2f).roundToInt().coerceIn(-120, 120))
-                                                prevY = change.position.y
-                                            }
-                                            change.consume()
-                                        } while (event.changes.any { it.pressed })
-                                    }
-                                },
-                            contentAlignment = Alignment.Center
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState()),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Text("Wheel", fontSize = 10.sp, color = titleColor.copy(alpha = 0.8f))
-                        }
-                    } else if (rightPanelMode == "screen") {
-                        if (screens.isEmpty()) {
-                            Text(
-                                "No screens",
-                                color = titleColor.copy(alpha = 0.58f),
-                                fontSize = 10.sp,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.padding(top = 12.dp)
-                            )
-                        } else {
-                            screens.forEach { screen ->
-                                val selected = selectedScreenIndex == screen.monitor_index
-                                Surface(
-                                    shape = RoundedCornerShape(12.dp),
-                                    color = if (selected) accentColor.copy(alpha = 0.18f) else Color.Transparent,
-                                    border = if (selected) BorderStroke(1.dp, accentColor) else null,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable { onScreenSelected(screen) }
-                                ) {
-                                    Column(
-                                        horizontalAlignment = Alignment.CenterHorizontally,
-                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 7.dp)
+                        if (rightPanelMode == "screen") {
+                            if (screens.isEmpty()) {
+                                Text(
+                                    "No screens",
+                                    color = titleColor.copy(alpha = 0.58f),
+                                    fontSize = 10.sp,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.padding(top = 12.dp)
+                                )
+                            } else {
+                                screens.forEach { screen ->
+                                    val selected = selectedScreenIndex == screen.monitor_index
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = if (selected) accentColor.copy(alpha = 0.18f) else Color.Transparent,
+                                        border = if (selected) BorderStroke(1.dp, accentColor) else null,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { onScreenSelected(screen) }
                                     ) {
-                                        if (selected) Icon(Icons.Default.Check, null, tint = accentColor, modifier = Modifier.size(14.dp))
-                                        Text(
-                                            "Display ${screen.monitor_index}",
-                                            color = titleColor,
-                                            fontSize = 10.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            textAlign = TextAlign.Center
-                                        )
-                                        Text(
-                                            "${screen.width}x${screen.height}",
-                                            color = titleColor.copy(alpha = 0.62f),
-                                            fontSize = 8.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            textAlign = TextAlign.Center
-                                        )
+                                        Column(
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 7.dp)
+                                        ) {
+                                            if (selected) Icon(Icons.Default.Check, null, tint = accentColor, modifier = Modifier.size(14.dp))
+                                            Text(
+                                                "Display ${screen.monitor_index}",
+                                                color = titleColor,
+                                                fontSize = 10.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                textAlign = TextAlign.Center
+                                            )
+                                            Text(
+                                                "${screen.width}x${screen.height}",
+                                                color = titleColor.copy(alpha = 0.62f),
+                                                fontSize = 8.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                textAlign = TextAlign.Center
+                                            )
+                                        }
                                     }
                                 }
                             }
-                        }
-                    } else windows.forEach { window ->
-                        val isSelected = window.hwnd == currentWindow.hwnd
-                        val bitmap = rememberIconBitmap(window.icon, window.hwnd)
-                        val border = if (isSelected) BorderStroke(2.dp, accentColor) else null
+                        } else windows.forEach { window ->
+                            val isSelected = window.hwnd == currentWindow.hwnd
+                            val bitmap = rememberIconBitmap(window.icon, window.hwnd)
+                            val border = if (isSelected) BorderStroke(2.dp, accentColor) else null
 
-                        Surface(
-                            shape = RoundedCornerShape(14.dp),
-                            color = if (isSelected) accentColor.copy(alpha = 0.14f) else Color.Transparent,
-                            border = border,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    onRowPageChange(window.hwnd)
-                                    onCenterChange(window.hwnd)
-                                    onSwitch(window.hwnd)
-                                }
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(vertical = 7.dp, horizontal = 4.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                color = if (isSelected) accentColor.copy(alpha = 0.14f) else Color.Transparent,
+                                border = border,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        onRowPageChange(window.hwnd)
+                                        onCenterChange(window.hwnd)
+                                        onSwitch(window.hwnd)
+                                    }
                             ) {
-                                IconContainer(bitmap, window.title, if (isSelected) 42.dp else 34.dp, accentColor, RoundedCornerShape(12.dp))
-                                if (showTitles) {
-                                    Text(
-                                        text = window.title,
+                                Column(
+                                    modifier = Modifier.padding(vertical = 7.dp, horizontal = 4.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    IconContainer(bitmap, window.title, if (isSelected) 42.dp else 34.dp, accentColor, RoundedCornerShape(12.dp))
+                                    if (showTitles) {
+                                        Text(
+                                            text = window.title,
                                         color = titleColor.copy(alpha = if (isSelected) 1f else 0.62f),
                                         fontSize = 8.sp,
+                                        lineHeight = 8.sp,
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis,
                                         textAlign = TextAlign.Center,
-                                        modifier = Modifier.padding(top = 3.dp)
-                                    )
+                                            modifier = Modifier.padding(top = 3.dp)
+                                        )
+                                    }
                                 }
                             }
+                        }
                         }
                     }
                     }
@@ -924,23 +1017,6 @@ fun rememberPreviewBitmap(previewStr: String, hwnd: Long): android.graphics.Bitm
 }
 
 @Composable
-fun rememberLiveFrameSize(frame: State<ByteArray?>, hwnd: Long): Pair<Int, Int>? {
-    var frameSize by remember(hwnd) { mutableStateOf<Pair<Int, Int>?>(null) }
-    LaunchedEffect(hwnd) {
-        snapshotFlow { frame.value }.collect { bytes ->
-            if (bytes == null || bytes.isEmpty()) return@collect
-            val size = withContext(Dispatchers.IO) {
-                val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-                if (options.outWidth > 0 && options.outHeight > 0) options.outWidth to options.outHeight else null
-            }
-            if (size != null && size != frameSize) frameSize = size
-        }
-    }
-    return frameSize
-}
-
-@Composable
 fun rememberIconBitmap(iconStr: String, hwnd: Long): android.graphics.Bitmap? {
     var bitmap by remember(hwnd) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(iconStr) {
@@ -954,6 +1030,27 @@ fun rememberIconBitmap(iconStr: String, hwnd: Long): android.graphics.Bitmap? {
         }
     }
     return bitmap
+}
+
+@Composable
+fun rememberLiveBitmapFrame(frame: State<ByteArray?>, hwnd: Long): State<Bitmap?> {
+    val bitmapState = remember(hwnd) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(hwnd) {
+        var lastRenderedAt = 0L
+        snapshotFlow { frame.value }.collectLatest { bytes ->
+            if (bytes == null || bytes.isEmpty()) return@collectLatest
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastRenderedAt < 16L) return@collectLatest
+            val decoded = withContext(Dispatchers.IO) {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            }
+            if (decoded != null) {
+                lastRenderedAt = android.os.SystemClock.uptimeMillis()
+                bitmapState.value = decoded
+            }
+        }
+    }
+    return bitmapState
 }
 
 fun lerp(start: Color, end: Color, fraction: Float): Color {
@@ -972,31 +1069,19 @@ fun LivePreviewContainer(
     accentColor: Color,
     containerColor: Color,
     clipPreview: Boolean,
-    cornerPx: Int
+    cornerPx: Int,
+    decodedBitmap: Bitmap? = null
 ) {
-    var bitmap by remember(currentWindow.hwnd) { mutableStateOf<Bitmap?>(null) }
+    val bitmap by if (decodedBitmap != null) {
+        remember(decodedBitmap) { mutableStateOf(decodedBitmap) }
+    } else {
+        rememberLiveBitmapFrame(frame, currentWindow.hwnd)
+    }
     val density = LocalDensity.current
     val previewShape = if (clipPreview) {
         RoundedCornerShape(with(density) { cornerPx.coerceAtLeast(0).toDp() })
     } else {
         RoundedCornerShape(0.dp)
-    }
-
-    LaunchedEffect(currentWindow.hwnd) {
-        snapshotFlow { frame.value }.collect { bytes ->
-            if (bytes == null || bytes.isEmpty()) return@collect
-
-            val decoded = withContext(Dispatchers.IO) {
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            }
-
-            if (decoded != null) {
-                Log.i("TaskbarLive", "Decoded preview bitmap ${decoded.width}x${decoded.height}")
-                bitmap = decoded
-            } else {
-                Log.w("TaskbarLive", "Failed to decode preview bytes=${bytes.size}")
-            }
-        }
     }
 
     val previewBitmap = bitmap
