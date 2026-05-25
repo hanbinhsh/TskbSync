@@ -12,6 +12,10 @@ import ctypes
 import hashlib
 import collections
 import concurrent.futures
+import subprocess
+import shutil
+import os
+from pathlib import Path
 from ctypes import wintypes
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Depends, Request
@@ -57,6 +61,7 @@ WGC_AVAILABLE = False
 try:
     from windows_capture import WindowsCapture, Frame
     import cv2
+    import numpy as np
     WGC_AVAILABLE = True
 except ImportError:
     pass
@@ -137,6 +142,416 @@ def get_window_preview_gdi(hwnd, q=65, w_limit=800, h_limit=600):
         gdi32.DeleteObject(hbmp); gdi32.DeleteObject(hbmp_full); gdi32.DeleteDC(hdc_mem); gdi32.DeleteDC(hdc_full); user32.ReleaseDC(0, hdc_screen)
         buf = io.BytesIO(); img.save(buf, format="JPEG", quality=q); return base64.b64encode(buf.getvalue()).decode('utf-8')
     except: return ""
+
+def resolve_ffmpeg_candidate(value):
+    raw = (value or "").strip().strip('"')
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    if path.is_dir():
+        path = path / "ffmpeg.exe"
+    if path.exists() and path.is_file():
+        return str(path)
+    return ""
+
+def get_ffmpeg_exe():
+    backend_dir = Path(__file__).resolve().parent
+    for env_key in ("TSKBSYNC_FFMPEG", "TSKBSYNC_FFMPEG_DIR"):
+        resolved = resolve_ffmpeg_candidate(os.environ.get(env_key, ""))
+        if resolved:
+            return resolved
+    path_file = backend_dir / "ffmpeg_path.txt"
+    if path_file.exists():
+        try:
+            for line in path_file.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                resolved = resolve_ffmpeg_candidate(stripped)
+                if resolved:
+                    return resolved
+        except Exception:
+            pass
+    local_ffmpeg = backend_dir / "bin" / "ffmpeg.exe"
+    if local_ffmpeg.exists():
+        return str(local_ffmpeg)
+    return shutil.which("ffmpeg")
+
+_h264_encoder_probe_cache = {
+    "probed": False,
+    "ffmpeg_path": "",
+    "encoder": None,
+    "encoder_profile": "",
+    "encoder_options": [],
+    "error": "",
+    "results": [],
+}
+
+def h264_encoder_option_variants(encoder, fps):
+    fps_int = max(5, min(int(round(fps)), 160))
+    if encoder == "h264_nvenc":
+        return [
+            ("nvenc-modern-ull", [
+                "-c:v", encoder,
+                "-preset", "p1",
+                "-tune", "ull",
+                "-rc", "constqp",
+                "-qp", "24",
+                "-bf", "0",
+                "-g", str(fps_int),
+                "-forced-idr", "1",
+                "-pix_fmt", "yuv420p",
+            ]),
+            ("nvenc-legacy-llhp", [
+                "-c:v", encoder,
+                "-preset", "llhp",
+                "-rc", "constqp",
+                "-qp", "24",
+                "-bf", "0",
+                "-g", str(fps_int),
+                "-pix_fmt", "yuv420p",
+            ]),
+            ("nvenc-legacy-hp", [
+                "-c:v", encoder,
+                "-preset", "hp",
+                "-rc", "constqp",
+                "-qp", "24",
+                "-bf", "0",
+                "-g", str(fps_int),
+                "-pix_fmt", "yuv420p",
+            ]),
+            ("nvenc-minimal", [
+                "-c:v", encoder,
+                "-bf", "0",
+                "-g", str(fps_int),
+                "-pix_fmt", "yuv420p",
+            ]),
+        ]
+    if encoder == "h264_qsv":
+        return [
+            ("qsv-lowlatency", [
+                "-c:v", encoder,
+                "-preset", "veryfast",
+                "-look_ahead", "0",
+                "-bf", "0",
+                "-g", str(fps_int),
+                "-global_quality", "24",
+                "-pix_fmt", "nv12",
+            ]),
+            ("qsv-minimal", [
+                "-c:v", encoder,
+                "-bf", "0",
+                "-g", str(fps_int),
+                "-pix_fmt", "nv12",
+            ]),
+        ]
+    if encoder == "h264_amf":
+        return [
+            ("amf-lowlatency", [
+                "-c:v", encoder,
+                "-quality", "speed",
+                "-usage", "lowlatency",
+                "-bf", "0",
+                "-g", str(fps_int),
+                "-qp_i", "24",
+                "-qp_p", "24",
+                "-pix_fmt", "yuv420p",
+            ]),
+            ("amf-minimal", [
+                "-c:v", encoder,
+                "-bf", "0",
+                "-g", str(fps_int),
+                "-pix_fmt", "yuv420p",
+            ]),
+        ]
+    return [("minimal", ["-c:v", encoder, "-bf", "0", "-g", str(fps_int), "-pix_fmt", "yuv420p"])]
+
+def estimate_h264_bitrate_kbps(width, height, fps, quality):
+    fps_int = max(5, min(int(round(fps)), 160))
+    quality = max(35, min(int(quality), 100))
+    scale = (width * height * fps_int) / float(1920 * 1080 * 60)
+    quality_curve = (quality / 100.0) ** 2
+    target_mbps = scale * (4.0 + quality_curve * 28.0)
+    target_kbps = int(max(1800, min(target_mbps * 1000, 85000)))
+    return target_kbps
+
+def h264_runtime_encoder_options(encoder, fps, width, height, quality):
+    fps_int = max(5, min(int(round(fps)), 160))
+    bitrate = estimate_h264_bitrate_kbps(width, height, fps_int, quality)
+    maxrate = int(bitrate * 1.35)
+    bufsize = max(1000, int(bitrate * 0.5))
+    cq = max(18, min(32, int(round(34 - (max(35, min(quality, 100)) - 35) * 12 / 65))))
+    if encoder == "h264_nvenc":
+        profile = _h264_encoder_probe_cache.get("encoder_profile") or ""
+        if profile == "nvenc-modern-ull":
+            return [
+                "-c:v", encoder,
+                "-preset", "p1",
+                "-tune", "ull",
+                "-rc", "vbr",
+                "-cq", str(cq),
+                "-b:v", f"{bitrate}k",
+                "-maxrate", f"{maxrate}k",
+                "-bufsize", f"{bufsize}k",
+                "-bf", "0",
+                "-g", str(fps_int),
+                "-forced-idr", "1",
+                "-pix_fmt", "yuv420p",
+            ], bitrate
+        return [
+            "-c:v", encoder,
+            "-preset", "llhp" if profile == "nvenc-legacy-llhp" else "hp",
+            "-rc", "vbr",
+            "-cq", str(cq),
+            "-b:v", f"{bitrate}k",
+            "-maxrate", f"{maxrate}k",
+            "-bufsize", f"{bufsize}k",
+            "-bf", "0",
+            "-g", str(fps_int),
+            "-pix_fmt", "yuv420p",
+        ], bitrate
+    if encoder == "h264_qsv":
+        return [
+            "-c:v", encoder,
+            "-preset", "veryfast",
+            "-look_ahead", "0",
+            "-b:v", f"{bitrate}k",
+            "-maxrate", f"{maxrate}k",
+            "-bufsize", f"{bufsize}k",
+            "-bf", "0",
+            "-g", str(fps_int),
+            "-pix_fmt", "nv12",
+        ], bitrate
+    if encoder == "h264_amf":
+        return [
+            "-c:v", encoder,
+            "-quality", "speed",
+            "-usage", "lowlatency",
+            "-b:v", f"{bitrate}k",
+            "-maxrate", f"{maxrate}k",
+            "-bufsize", f"{bufsize}k",
+            "-bf", "0",
+            "-g", str(fps_int),
+            "-pix_fmt", "yuv420p",
+        ], bitrate
+    return h264_encoder_option_variants(encoder, fps_int)[-1][1], bitrate
+
+def probe_h264_encoder(ffmpeg, encoder):
+    failures = []
+    for profile, options in h264_encoder_option_variants(encoder, 30):
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=640x360:rate=30,format=yuv420p",
+            "-t",
+            "0.2",
+            *options,
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                capture_output=True,
+                timeout=8,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0:
+                return True, "", profile, options
+            failures.append(f"{profile}: {(result.stderr or result.stdout or '').strip()}")
+        except Exception as e:
+            failures.append(f"{profile}: {type(e).__name__}: {e}")
+    return False, " || ".join(failures), "", []
+
+def get_h264_probe_error():
+    return _h264_encoder_probe_cache.get("error") or "No usable hardware H.264 encoder found"
+
+def get_h264_hardware_encoder(force_probe=False):
+    global _h264_encoder_probe_cache
+    if _h264_encoder_probe_cache.get("probed") and not force_probe:
+        return _h264_encoder_probe_cache.get("encoder")
+    ffmpeg = get_ffmpeg_exe()
+    if not ffmpeg:
+        _h264_encoder_probe_cache = {
+            "probed": True,
+            "ffmpeg_path": "",
+            "encoder": None,
+            "encoder_profile": "",
+            "encoder_options": [],
+            "error": "ffmpeg.exe was not found. Set TSKBSYNC_FFMPEG/TSKBSYNC_FFMPEG_DIR, write a path to pc_backend\\ffmpeg_path.txt, put ffmpeg.exe in pc_backend\\bin, or add ffmpeg to PATH.",
+            "results": [],
+        }
+        return None
+    try:
+        output = subprocess.check_output([ffmpeg, "-hide_banner", "-encoders"], text=True, errors="ignore")
+    except Exception as e:
+        _h264_encoder_probe_cache = {
+            "probed": True,
+            "ffmpeg_path": ffmpeg,
+            "encoder": None,
+            "encoder_profile": "",
+            "encoder_options": [],
+            "error": f"Failed to query ffmpeg encoders: {type(e).__name__}: {e}",
+            "results": [],
+        }
+        return None
+    errors = []
+    results = []
+    for encoder in ("h264_nvenc", "h264_qsv", "h264_amf"):
+        if encoder in output:
+            ok, err, profile, options = probe_h264_encoder(ffmpeg, encoder)
+            results.append({
+                "encoder": encoder,
+                "available": True,
+                "usable": ok,
+                "profile": profile,
+                "message": "" if ok else err,
+            })
+            if ok:
+                _h264_encoder_probe_cache = {
+                    "probed": True,
+                    "ffmpeg_path": ffmpeg,
+                    "encoder": encoder,
+                    "encoder_profile": profile,
+                    "encoder_options": options,
+                    "error": "",
+                    "results": results,
+                }
+                return encoder
+            errors.append(f"{encoder}: {err}")
+        else:
+            results.append({"encoder": encoder, "available": False, "usable": False, "profile": "", "message": "not listed by ffmpeg"})
+            errors.append(f"{encoder}: not listed by ffmpeg")
+    error_message = "No usable hardware H.264 encoder found. " + " | ".join(errors)
+    if errors:
+        print("[h264] " + error_message, flush=True)
+    _h264_encoder_probe_cache = {
+        "probed": True,
+        "ffmpeg_path": ffmpeg,
+        "encoder": None,
+        "encoder_profile": "",
+        "encoder_options": [],
+        "error": error_message,
+        "results": results,
+    }
+    return None
+
+def get_h264_status(force_probe=False):
+    encoder = get_h264_hardware_encoder(force_probe=force_probe)
+    return {
+        "ffmpeg_path": _h264_encoder_probe_cache.get("ffmpeg_path") or get_ffmpeg_exe() or "",
+        "selected_encoder": encoder or "",
+        "selected_profile": _h264_encoder_probe_cache.get("encoder_profile") or "",
+        "usable": bool(encoder),
+        "message": _h264_encoder_probe_cache.get("error") or ("Hardware H.264 encoder ready" if encoder else ""),
+        "results": _h264_encoder_probe_cache.get("results") or [],
+        "lookup_order": [
+            "TSKBSYNC_FFMPEG",
+            "TSKBSYNC_FFMPEG_DIR",
+            str(Path(__file__).resolve().parent / "ffmpeg_path.txt"),
+            str(Path(__file__).resolve().parent / "bin" / "ffmpeg.exe"),
+            "PATH",
+        ],
+    }
+
+def read_ffmpeg_stderr(proc):
+    if not proc or proc.poll() is None or not proc.stderr:
+        return ""
+    try:
+        data = proc.stderr.read()
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="replace").strip()
+        return (data or "").strip()
+    except Exception:
+        return ""
+
+def resize_for_stream(img_array, max_dim):
+    h, w = img_array.shape[:2]
+    if w > max_dim or h > max_dim:
+        scale = min(max_dim / w, max_dim / h)
+        w, h = max(1, int(w * scale)), max(1, int(h * scale))
+        img_array = cv2.resize(img_array, (w, h), interpolation=cv2.INTER_AREA)
+    h, w = img_array.shape[:2]
+    even_w = max(2, w - (w % 2))
+    even_h = max(2, h - (h % 2))
+    if even_w != w or even_h != h:
+        img_array = cv2.resize(img_array, (even_w, even_h), interpolation=cv2.INTER_AREA)
+    return img_array
+
+def fit_frame_to_size(img_array, target_w, target_h):
+    h, w = img_array.shape[:2]
+    if w == target_w and h == target_h:
+        return np.ascontiguousarray(img_array)
+    scale = min(target_w / max(w, 1), target_h / max(h, 1))
+    new_w = max(1, min(target_w, int(round(w * scale))))
+    new_h = max(1, min(target_h, int(round(h * scale))))
+    resized = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    top = (target_h - new_h) // 2
+    bottom = target_h - new_h - top
+    left = (target_w - new_w) // 2
+    right = target_w - new_w - left
+    border_value = (0, 0, 0, 255) if len(resized.shape) == 3 and resized.shape[2] == 4 else (0, 0, 0)
+    return cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=border_value)
+
+def start_h264_encoder(width, height, fps, quality):
+    ffmpeg = get_ffmpeg_exe()
+    encoder = get_h264_hardware_encoder()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg.exe was not found in PATH")
+    if not encoder:
+        raise RuntimeError(get_h264_probe_error())
+    fps_int = max(5, min(int(round(fps)), 160))
+    encoder_options, bitrate = h264_runtime_encoder_options(encoder, fps_int, width, height, quality)
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps_int),
+        "-i",
+        "pipe:0",
+        "-an",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        *encoder_options,
+        "-flush_packets",
+        "1",
+        "-f",
+        "h264",
+        "pipe:1",
+    ]
+    profile = _h264_encoder_probe_cache.get("encoder_profile") or "default"
+    print(f"[h264] starting ffmpeg encoder={encoder} profile={profile} size={width}x{height} fps={fps_int} target={bitrate}kbps", flush=True)
+    return subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    ), encoder
+
+def prepare_h264_input_frame(img_array, stream_max_dim, target_w, target_h):
+    fitted = fit_frame_to_size(resize_for_stream(img_array, stream_max_dim), target_w, target_h)
+    if len(fitted.shape) == 3 and fitted.shape[2] == 4:
+        return cv2.cvtColor(fitted, cv2.COLOR_BGRA2YUV_I420).tobytes()
+    return cv2.cvtColor(fitted, cv2.COLOR_BGR2YUV_I420).tobytes()
 
 def is_taskbar_window(hwnd):
     if not win32gui.IsWindowVisible(hwnd): return False
@@ -784,6 +1199,10 @@ async def set_grid_preview(interval_ms: int = 2000):
     GRID_PREVIEW_INTERVAL = max(0.5, min(float(interval_ms) / 1000.0, 10.0))
     return {"interval_ms": int(GRID_PREVIEW_INTERVAL * 1000)}
 
+@app.get("/h264/status")
+async def h264_status_endpoint(refresh: bool = False):
+    return get_h264_status(force_probe=refresh)
+
 @app.post("/config/window_filter")
 async def set_window_filter(request: Request):
     global WINDOW_FILTER_CONFIG
@@ -1108,6 +1527,232 @@ async def live_screen_stream_endpoint(
                 capture_control.stop()
             except Exception:
                 pass
+        await safe_close(websocket)
+
+async def stream_h264_capture(websocket: WebSocket, capture, label: str, stream_max_dim: float, stream_fps: float, stream_quality: int):
+    capture_control = None
+    encoder_process = None
+    reader_task = None
+    loop = asyncio.get_running_loop()
+    frame_event = asyncio.Event()
+    wgc_buffer = collections.deque(maxlen=1)
+    last_accepted_frame = 0.0
+    captured_frames = 0
+    dropped_by_fps = 0
+    dropped_busy = 0
+    output_chunks = 0
+    output_bytes = 0
+    total_prep_ms = 0.0
+    max_prep_ms = 0.0
+    total_write_ms = 0.0
+    max_write_ms = 0.0
+    slow_writes = 0
+
+    @capture.event
+    def on_frame_arrived(frame: Frame, _):
+        nonlocal last_accepted_frame, captured_frames, dropped_by_fps, dropped_busy
+        try:
+            now = time.perf_counter()
+            if now - last_accepted_frame < (1.0 / max(stream_fps, 1.0)):
+                dropped_by_fps += 1
+                return
+            if wgc_buffer:
+                dropped_busy += 1
+                return
+            last_accepted_frame = now
+            captured_frames += 1
+            wgc_buffer.append(frame.frame_buffer)
+            loop.call_soon_threadsafe(frame_event.set)
+        except Exception as e:
+            print(f"[h264] frame callback failed {label}: {type(e).__name__}: {e}", flush=True)
+
+    @capture.event
+    def on_closed(*_):
+        try:
+            loop.call_soon_threadsafe(frame_event.set)
+        except Exception:
+            pass
+
+    async def send_encoder_output(proc):
+        nonlocal output_chunks, output_bytes
+        fd = proc.stdout.fileno()
+        while not shutdown_event.is_set():
+            chunk = await asyncio.to_thread(os.read, fd, 4096)
+            if not chunk:
+                break
+            await websocket.send_bytes(chunk)
+            output_chunks += 1
+            output_bytes += len(chunk)
+
+    try:
+        if not get_ffmpeg_exe():
+            await websocket.send_text(json.dumps({"type": "error", "message": "ffmpeg.exe was not found in PATH"}))
+            return
+        if not get_h264_hardware_encoder():
+            await websocket.send_text(json.dumps({"type": "error", "message": get_h264_probe_error()}))
+            return
+
+        capture_control = capture.start_free_threaded()
+        while not wgc_buffer and not shutdown_event.is_set():
+            await asyncio.wait_for(frame_event.wait(), timeout=3.0)
+            frame_event.clear()
+            if capture_control and capture_control.is_finished():
+                break
+        if not wgc_buffer:
+            await websocket.send_text(json.dumps({"type": "error", "message": "No WGC frame received"}))
+            return
+
+        first_frame = resize_for_stream(wgc_buffer.pop(), stream_max_dim)
+        height, width = first_frame.shape[:2]
+        encoder_process, encoder_name = start_h264_encoder(width, height, stream_fps, stream_quality)
+
+        async def write_frame(img_array):
+            nonlocal total_prep_ms, max_prep_ms, total_write_ms, max_write_ms, slow_writes
+            if encoder_process.poll() is not None:
+                stderr = read_ffmpeg_stderr(encoder_process)
+                raise RuntimeError(f"ffmpeg encoder exited before frame write: {stderr}".strip())
+            prep_start = time.perf_counter()
+            raw = prepare_h264_input_frame(img_array, stream_max_dim, width, height)
+            prep_ms = (time.perf_counter() - prep_start) * 1000.0
+            total_prep_ms += prep_ms
+            max_prep_ms = max(max_prep_ms, prep_ms)
+            write_start = time.perf_counter()
+            try:
+                await asyncio.to_thread(encoder_process.stdin.write, raw)
+            except BrokenPipeError:
+                stderr = read_ffmpeg_stderr(encoder_process)
+                raise RuntimeError(f"ffmpeg encoder pipe closed: {stderr}".strip())
+            elapsed_ms = (time.perf_counter() - write_start) * 1000.0
+            total_write_ms += elapsed_ms
+            max_write_ms = max(max_write_ms, elapsed_ms)
+            if elapsed_ms > 24.0:
+                slow_writes += 1
+            if encoder_process.poll() is not None:
+                stderr = read_ffmpeg_stderr(encoder_process)
+                raise RuntimeError(f"ffmpeg encoder exited after frame write: {stderr}".strip())
+
+        await write_frame(first_frame)
+        await websocket.send_text(json.dumps({
+            "type": "video_config",
+            "codec": "h264",
+            "encoder": encoder_name,
+            "width": width,
+            "height": height,
+            "fps": int(stream_fps),
+        }))
+        reader_task = asyncio.create_task(send_encoder_output(encoder_process))
+
+        sent_frames = 1
+        last_log_at = time.perf_counter()
+        last_log_frames = sent_frames
+        last_log_bytes = output_bytes
+        while not shutdown_event.is_set():
+            if reader_task and reader_task.done():
+                stderr = read_ffmpeg_stderr(encoder_process)
+                if encoder_process and encoder_process.poll() is not None:
+                    raise RuntimeError(f"ffmpeg encoder output ended: {stderr}".strip())
+                break
+            try:
+                await asyncio.wait_for(frame_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            frame_event.clear()
+            if capture_control and capture_control.is_finished() and not wgc_buffer:
+                break
+            if wgc_buffer:
+                await write_frame(wgc_buffer.pop())
+                sent_frames += 1
+                now = time.perf_counter()
+                if sent_frames == 1 or now - last_log_at >= 3.0:
+                    interval = max(0.001, now - last_log_at)
+                    fps_out = (sent_frames - last_log_frames) / interval
+                    mbps = ((output_bytes - last_log_bytes) * 8.0 / 1_000_000.0) / interval
+                    avg_prep = total_prep_ms / max(sent_frames, 1)
+                    avg_write = total_write_ms / max(sent_frames, 1)
+                    last_log_at = now
+                    last_log_frames = sent_frames
+                    last_log_bytes = output_bytes
+                    print(
+                        f"[h264] stats {label} fed={sent_frames} out_fps={fps_out:.1f} "
+                        f"net={mbps:.1f}Mbps chunks={output_chunks} captured={captured_frames} "
+                        f"drop_fps={dropped_by_fps} drop_busy={dropped_busy} "
+                        f"prep_avg={avg_prep:.1f}ms prep_max={max_prep_ms:.1f}ms "
+                        f"write_avg={avg_write:.1f}ms write_max={max_write_ms:.1f}ms slow_writes={slow_writes}",
+                        flush=True
+                    )
+    except Exception as e:
+        print(f"[h264] stream failed {label}: {type(e).__name__}: {e}", flush=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": f"{type(e).__name__}: {e}"}))
+        except Exception:
+            pass
+    finally:
+        if reader_task:
+            reader_task.cancel()
+        if encoder_process:
+            try:
+                if encoder_process.stdin:
+                    encoder_process.stdin.close()
+            except Exception:
+                pass
+            try:
+                encoder_process.terminate()
+            except Exception:
+                pass
+        if capture_control:
+            try:
+                capture_control.stop()
+            except Exception:
+                pass
+
+@app.websocket("/live_h264/{hwnd}")
+async def live_h264_stream_endpoint(
+    websocket: WebSocket,
+    hwnd: int,
+    max_dim: int | None = None,
+    quality: int | None = None,
+    fps: int | None = None
+):
+    global active_live_streams
+    await websocket.accept()
+    active_live_streams += 1
+    try:
+        if not WGC_AVAILABLE:
+            await websocket.send_text(json.dumps({"type": "error", "message": "windows_capture is unavailable"}))
+            return
+        stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 3840)))
+        stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 100))
+        stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 160)))
+        title = win32gui.GetWindowText(hwnd)
+        print(f"[h264] start WGC hwnd={hwnd} title={title!r} max_dim={stream_max_dim:.0f} quality={stream_quality} fps={stream_fps:.0f}", flush=True)
+        await stream_h264_capture(websocket, WindowsCapture(window_name=title, draw_border=False), f"hwnd={hwnd}", stream_max_dim, stream_fps, stream_quality)
+    finally:
+        active_live_streams = max(0, active_live_streams - 1)
+        await safe_close(websocket)
+
+@app.websocket("/live_h264/screen/{monitor_index}")
+async def live_h264_screen_stream_endpoint(
+    websocket: WebSocket,
+    monitor_index: int,
+    max_dim: int | None = None,
+    quality: int | None = None,
+    fps: int | None = None
+):
+    global active_live_streams
+    await websocket.accept()
+    active_live_streams += 1
+    try:
+        if not WGC_AVAILABLE:
+            await websocket.send_text(json.dumps({"type": "error", "message": "windows_capture is unavailable"}))
+            return
+        _ = get_screen_rect(monitor_index)
+        stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 3840)))
+        stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 100))
+        stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 160)))
+        print(f"[h264] start WGC screen={monitor_index} max_dim={stream_max_dim:.0f} quality={stream_quality} fps={stream_fps:.0f}", flush=True)
+        await stream_h264_capture(websocket, WindowsCapture(monitor_index=monitor_index, draw_border=False), f"screen={monitor_index}", stream_max_dim, stream_fps, stream_quality)
+    finally:
+        active_live_streams = max(0, active_live_streams - 1)
         await safe_close(websocket)
 
 # ---------------- 捕获 CancelledError 异常，防止红字报错 ----------------

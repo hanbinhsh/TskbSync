@@ -36,6 +36,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val showTitles by viewModel.showTitles
     val shortcuts by viewModel.shortcuts
     val windowFilter by viewModel.windowFilter
+    val h264Status by viewModel.h264Status
     
     var tempIp by remember { mutableStateOf(pcIp) }
     var tempPass by remember { mutableStateOf(password) }
@@ -53,6 +54,10 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     
     val themeColor = Color(theme.color)
     val titleColor = Color(theme.titleColor)
+
+    LaunchedEffect(pcIp) {
+        if (pcIp.isNotEmpty()) viewModel.fetchH264Status()
+    }
 
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let { viewModel.saveWallpaper(it) }
@@ -181,6 +186,18 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     StreamSlider("Stream FPS", theme.streamFps, " fps", 5f..160f, 30) {
                                         viewModel.updateTheme(theme.copy(streamFps = it))
                                     }
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Text("Hardware H.264 Encoding", modifier = Modifier.weight(1f))
+                                        Switch(
+                                            checked = theme.useHardwareEncoding,
+                                            onCheckedChange = { viewModel.updateTheme(theme.copy(useHardwareEncoding = it)) }
+                                        )
+                                    }
+                                    H264StatusPanel(
+                                        status = h264Status,
+                                        enabled = theme.useHardwareEncoding,
+                                        onRefresh = { viewModel.fetchH264Status(refresh = true) }
+                                    )
                                     StreamSlider("Grid Refresh", theme.gridPreviewIntervalMs, " ms", 500f..3000f, 24) {
                                         viewModel.updateTheme(theme.copy(gridPreviewIntervalMs = it))
                                     }
@@ -482,6 +499,89 @@ fun StreamSlider(
             valueRange = range,
             steps = steps
         )
+    }
+}
+
+@Composable
+fun H264StatusPanel(
+    status: H264StatusInfo?,
+    enabled: Boolean,
+    onRefresh: () -> Unit
+) {
+    val bg = if (status?.usable == true) {
+        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+    } else {
+        MaterialTheme.colorScheme.errorContainer.copy(alpha = if (enabled) 0.45f else 0.22f)
+    }
+    val fg = if (status?.usable == true) {
+        MaterialTheme.colorScheme.onPrimaryContainer
+    } else {
+        MaterialTheme.colorScheme.onErrorContainer
+    }
+
+    Surface(
+        color = bg,
+        contentColor = fg,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp)
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    if (status?.usable == true) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = when {
+                        status == null -> "Hardware encoder status not checked"
+                        status.usable -> "Hardware encoder ready: ${status.selected_encoder}" +
+                            if (status.selected_profile.isBlank()) "" else " (${status.selected_profile})"
+                        enabled -> "Hardware encoder unavailable"
+                        else -> "Hardware encoder disabled"
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onRefresh, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Check")
+                }
+            }
+            if (status != null) {
+                Text(
+                    text = "FFmpeg: ${status.ffmpeg_path.ifEmpty { "Not found" }}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontSize = 11.sp
+                )
+                if (status.message.isNotBlank()) {
+                    Text(
+                        text = status.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontSize = 11.sp,
+                        maxLines = 4
+                    )
+                }
+                status.results.forEach { result ->
+                    Text(
+                        text = "${result.encoder}: ${if (result.usable) "OK ${result.profile}" else if (result.available) "Failed" else "Missing"}" +
+                            if (result.message.isBlank()) "" else " - ${result.message.lineSequence().firstOrNull().orEmpty()}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontSize = 10.sp,
+                        maxLines = 2
+                    )
+                }
+            } else {
+                Text(
+                    text = "Set TSKBSYNC_FFMPEG/TSKBSYNC_FFMPEG_DIR, use pc_backend\\ffmpeg_path.txt, or use PATH.",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontSize = 11.sp
+                )
+            }
+        }
     }
 }
 

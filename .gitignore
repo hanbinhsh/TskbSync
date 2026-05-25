@@ -17,3 +17,6 @@ local.properties
 .idea
 __pycache__
 pc_backend/logs/
+pc_backend/ffmpeg_path.txt
+pc_backend/bin/ffmpeg.exe
+pc_backend/bin/ffprobe.exe

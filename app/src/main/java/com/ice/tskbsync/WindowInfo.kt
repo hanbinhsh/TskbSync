@@ -28,3 +28,23 @@ data class ScreenInfo(
     val device: String = "",
     val name: String = ""
 )
+
+@Serializable
+data class H264EncoderProbe(
+    val encoder: String = "",
+    val available: Boolean = false,
+    val usable: Boolean = false,
+    val profile: String = "",
+    val message: String = ""
+)
+
+@Serializable
+data class H264StatusInfo(
+    val ffmpeg_path: String = "",
+    val selected_encoder: String = "",
+    val selected_profile: String = "",
+    val usable: Boolean = false,
+    val message: String = "",
+    val results: List<H264EncoderProbe> = emptyList(),
+    val lookup_order: List<String> = emptyList()
+)

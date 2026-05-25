@@ -41,6 +41,7 @@ data class ThemeSettings(
     val streamMaxDim: Int,
     val streamQuality: Int,
     val streamFps: Int,
+    val useHardwareEncoding: Boolean,
     val gridPreviewIntervalMs: Int,
     val clipLivePreview: Boolean,
     val livePreviewCornerPx: Int
@@ -68,6 +69,7 @@ class SettingsManager(private val context: Context) {
         private val STREAM_MAX_DIM_KEY = intPreferencesKey("stream_max_dim")
         private val STREAM_QUALITY_KEY = intPreferencesKey("stream_quality")
         private val STREAM_FPS_KEY = intPreferencesKey("stream_fps")
+        private val HARDWARE_ENCODING_KEY = booleanPreferencesKey("hardware_encoding")
         private val GRID_PREVIEW_INTERVAL_MS_KEY = intPreferencesKey("grid_preview_interval_ms")
         private val CLIP_LIVE_PREVIEW_KEY = booleanPreferencesKey("clip_live_preview")
         private val LIVE_PREVIEW_CORNER_PX_KEY = intPreferencesKey("live_preview_corner_px")
@@ -122,6 +124,7 @@ class SettingsManager(private val context: Context) {
             streamMaxDim = pref[STREAM_MAX_DIM_KEY] ?: 720,
             streamQuality = pref[STREAM_QUALITY_KEY] ?: 72,
             streamFps = pref[STREAM_FPS_KEY] ?: 30,
+            useHardwareEncoding = pref[HARDWARE_ENCODING_KEY] ?: false,
             gridPreviewIntervalMs = pref[GRID_PREVIEW_INTERVAL_MS_KEY] ?: 2000,
             clipLivePreview = pref[CLIP_LIVE_PREVIEW_KEY] ?: false,
             livePreviewCornerPx = pref[LIVE_PREVIEW_CORNER_PX_KEY] ?: 18
@@ -158,6 +161,7 @@ class SettingsManager(private val context: Context) {
             pref[STREAM_MAX_DIM_KEY] = settings.streamMaxDim
             pref[STREAM_QUALITY_KEY] = settings.streamQuality
             pref[STREAM_FPS_KEY] = settings.streamFps
+            pref[HARDWARE_ENCODING_KEY] = settings.useHardwareEncoding
             pref[GRID_PREVIEW_INTERVAL_MS_KEY] = settings.gridPreviewIntervalMs
             pref[CLIP_LIVE_PREVIEW_KEY] = settings.clipLivePreview
             pref[LIVE_PREVIEW_CORNER_PX_KEY] = settings.livePreviewCornerPx

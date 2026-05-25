@@ -22,13 +22,18 @@ import io.ktor.websocket.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import kotlin.math.roundToLong
+
+data class H264VideoConfig(val width: Int, val height: Int)
 
 class TaskbarViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsManager = SettingsManager(application)
@@ -62,7 +67,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _password = mutableStateOf("")
     val password: State<String> = _password
 
-    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, 2000, false, 18))
+    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, 2000, false, 18))
     val theme: State<ThemeSettings> = _theme
 
     private val _layoutMode = mutableStateOf("grid")
@@ -80,6 +85,14 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     // Decoupled Previews
     private val _focusedLiveFrame = mutableStateOf<ByteArray?>(null)
     val focusedLiveFrame: State<ByteArray?> = _focusedLiveFrame
+    private val _h264VideoConfig = mutableStateOf<H264VideoConfig?>(null)
+    val h264VideoConfig: State<H264VideoConfig?> = _h264VideoConfig
+    private val _h264Error = mutableStateOf<String?>(null)
+    val h264Error: State<String?> = _h264Error
+    private val _h264Status = mutableStateOf<H264StatusInfo?>(null)
+    val h264Status: State<H264StatusInfo?> = _h264Status
+    private val _h264Frames = MutableSharedFlow<ByteArray>(extraBufferCapacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    val h264Frames: SharedFlow<ByteArray> = _h264Frames
 
     private val _selectedRowHwnd = mutableStateOf<Long?>(null)
     val selectedRowHwnd: State<Long?> = _selectedRowHwnd
@@ -190,6 +203,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         _selectedRowHwnd.value = hwnd
         liveStreamJob?.cancel()
         _focusedLiveFrame.value = null
+        _h264VideoConfig.value = null
+        _h264Error.value = null
         val ip = _pcIp.value
         if (ip.isEmpty() || hwnd == 0L) return
 
@@ -197,7 +212,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             try {
                 val streamSettings = _theme.value
                 applyBackendStreamConfig(streamSettings, ip)
-                val liveUrl = "ws://$ip:8000/live/$hwnd" +
+                val livePath = if (streamSettings.useHardwareEncoding) "live_h264" else "live"
+                val liveUrl = "ws://$ip:8000/$livePath/$hwnd" +
                     "?max_dim=${streamSettings.streamMaxDim}" +
                     "&quality=${streamSettings.streamQuality}" +
                     "&fps=${streamSettings.streamFps}"
@@ -215,16 +231,32 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                 if (receivedFrames == 1 || receivedFrames % 60 == 0) {
                                     Log.i("TaskbarLive", "Received binary frame count=$receivedFrames bytes=${bytes.size}")
                                 }
-                                val now = android.os.SystemClock.uptimeMillis()
-                                if (now - lastPublishedAt >= publishIntervalMs) {
-                                    lastPublishedAt = now
-                                    _focusedLiveFrame.value = bytes
+                                if (streamSettings.useHardwareEncoding) {
+                                    _h264Frames.tryEmit(bytes)
+                                } else {
+                                    val now = android.os.SystemClock.uptimeMillis()
+                                    if (now - lastPublishedAt >= publishIntervalMs) {
+                                        lastPublishedAt = now
+                                        _focusedLiveFrame.value = bytes
+                                    }
                                 }
                             }
                             is Frame.Text -> {
                                 val text = frame.readText()
                                 Log.i("TaskbarLive", "Received text frame: ${text.take(120)}")
-                                if (text.isNotEmpty() && !text.startsWith("status:") && !text.startsWith("error:")) {
+                                val parsed = runCatching { Json.parseToJsonElement(text).jsonObject }.getOrNull()
+                                if (parsed?.get("type")?.jsonPrimitive?.content == "video_config") {
+                                    val width = parsed["width"]?.jsonPrimitive?.intOrNull ?: 0
+                                    val height = parsed["height"]?.jsonPrimitive?.intOrNull ?: 0
+                                    if (width > 0 && height > 0) {
+                                        _h264Error.value = null
+                                        _h264VideoConfig.value = H264VideoConfig(width, height)
+                                    }
+                                } else if (parsed?.get("type")?.jsonPrimitive?.content == "error") {
+                                    val message = parsed["message"]?.jsonPrimitive?.content ?: "Hardware stream failed"
+                                    _h264Error.value = message
+                                    _inputStatus.value = message
+                                } else if (text.isNotEmpty() && !text.startsWith("status:") && !text.startsWith("error:")) {
                                     _focusedLiveFrame.value = android.util.Base64.decode(text, android.util.Base64.DEFAULT)
                                 }
                             }
@@ -241,6 +273,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     fun stopLiveStream() {
         liveStreamJob?.cancel()
         _focusedLiveFrame.value = null
+        _h264VideoConfig.value = null
+        _h264Error.value = null
     }
 
     fun startRemoteInput(hwnd: Long) {
@@ -453,6 +487,9 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         if (newTheme.gridPreviewIntervalMs != oldTheme.gridPreviewIntervalMs) {
             viewModelScope.launch { applyGridPreviewConfig(newTheme) }
         }
+        if (newTheme.useHardwareEncoding != oldTheme.useHardwareEncoding && newTheme.useHardwareEncoding) {
+            fetchH264Status(refresh = true)
+        }
         viewModelScope.launch { settingsManager.saveTheme(newTheme) }
     }
 
@@ -479,6 +516,23 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         } catch (e: Exception) { }
     }
 
+    fun fetchH264Status(refresh: Boolean = false) {
+        viewModelScope.launch {
+            val ip = _pcIp.value
+            if (ip.isEmpty()) return@launch
+            try {
+                _h264Status.value = client.get("http://$ip:8000/h264/status") {
+                    parameter("refresh", refresh)
+                }.body()
+            } catch (e: Exception) {
+                _h264Status.value = H264StatusInfo(
+                    usable = false,
+                    message = "Failed to fetch H.264 status: ${e.localizedMessage}"
+                )
+            }
+        }
+    }
+
     private suspend fun applyWindowFilterConfig(settings: WindowFilterSettings, ipOverride: String? = null) {
         val ip = ipOverride ?: _pcIp.value
         if (ip.isEmpty()) return
@@ -499,13 +553,16 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     fun startLiveScreenStream(monitorIndex: Int) {
         liveStreamJob?.cancel()
         _focusedLiveFrame.value = null
+        _h264VideoConfig.value = null
+        _h264Error.value = null
         val ip = _pcIp.value
         if (ip.isEmpty() || monitorIndex <= 0) return
         liveStreamJob = viewModelScope.launch {
             try {
                 val streamSettings = _theme.value
                 applyBackendStreamConfig(streamSettings, ip)
-                val liveUrl = "ws://$ip:8000/live/screen/$monitorIndex" +
+                val livePath = if (streamSettings.useHardwareEncoding) "live_h264/screen" else "live/screen"
+                val liveUrl = "ws://$ip:8000/$livePath/$monitorIndex" +
                     "?max_dim=${streamSettings.streamMaxDim}" +
                     "&quality=${streamSettings.streamQuality}" +
                     "&fps=${streamSettings.streamFps}"
@@ -516,13 +573,31 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                     for (frame in incoming) {
                         if (frame is Frame.Binary) {
                             val bytes = frame.readBytes()
-                            val now = android.os.SystemClock.uptimeMillis()
-                            if (now - lastPublishedAt >= publishIntervalMs) {
-                                lastPublishedAt = now
-                                _focusedLiveFrame.value = bytes
+                            if (streamSettings.useHardwareEncoding) {
+                                _h264Frames.tryEmit(bytes)
+                            } else {
+                                val now = android.os.SystemClock.uptimeMillis()
+                                if (now - lastPublishedAt >= publishIntervalMs) {
+                                    lastPublishedAt = now
+                                    _focusedLiveFrame.value = bytes
+                                }
                             }
                         } else if (frame is Frame.Text) {
-                            Log.i("TaskbarLive", frame.readText())
+                            val text = frame.readText()
+                            Log.i("TaskbarLive", text)
+                            val parsed = runCatching { Json.parseToJsonElement(text).jsonObject }.getOrNull()
+                            if (parsed?.get("type")?.jsonPrimitive?.content == "video_config") {
+                                val width = parsed["width"]?.jsonPrimitive?.intOrNull ?: 0
+                                val height = parsed["height"]?.jsonPrimitive?.intOrNull ?: 0
+                                if (width > 0 && height > 0) {
+                                    _h264Error.value = null
+                                    _h264VideoConfig.value = H264VideoConfig(width, height)
+                                }
+                            } else if (parsed?.get("type")?.jsonPrimitive?.content == "error") {
+                                val message = parsed["message"]?.jsonPrimitive?.content ?: "Hardware stream failed"
+                                _h264Error.value = message
+                                _inputStatus.value = message
+                            }
                         }
                     }
                 }

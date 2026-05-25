@@ -1,0 +1,6 @@
+# Optional: copy this file to ffmpeg_path.txt and put either an ffmpeg.exe path
+# or an FFmpeg directory on the first non-comment line.
+#
+# Examples:
+# C:\ffmpeg\bin
+# C:\ffmpeg\bin\ffmpeg.exe

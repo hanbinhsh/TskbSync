@@ -1,7 +1,12 @@
 package com.ice.tskbsync
 
 import android.graphics.BitmapFactory
+import android.media.MediaCodec
+import android.media.MediaFormat
 import android.util.Base64
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.SizeTransform
@@ -51,6 +56,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
@@ -66,6 +72,7 @@ import java.util.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.SharedFlow
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.runtime.snapshotFlow
 import android.graphics.Bitmap
@@ -313,9 +320,13 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     containerAlpha = theme.rowContainerAlpha,
                                     showTitles = showTitles,
                                     showPreviews = theme.showPreviews,
+                                    useHardwareEncoding = theme.useHardwareEncoding,
                                     clipLivePreview = theme.clipLivePreview,
                                     livePreviewCornerPx = theme.livePreviewCornerPx,
                                     focusedLiveFrame = viewModel.focusedLiveFrame,
+                                    h264VideoConfig = viewModel.h264VideoConfig,
+                                    h264Error = viewModel.h264Error,
+                                    h264Frames = viewModel.h264Frames,
                                     inputStatus = inputStatus,
                                     onDismissInputStatus = { viewModel.clearInputStatus() },
                                     selectedRowHwnd = viewModel.selectedRowHwnd.value,
@@ -420,9 +431,13 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         containerColor = containerBgBase,
                                         containerAlpha = theme.rowContainerAlpha,
                                         showPreviews = theme.showPreviews,
+                                        useHardwareEncoding = theme.useHardwareEncoding,
                                         clipLivePreview = theme.clipLivePreview,
                                         livePreviewCornerPx = theme.livePreviewCornerPx,
                                         focusedLiveFrame = viewModel.focusedLiveFrame,
+                                        h264VideoConfig = viewModel.h264VideoConfig,
+                                        h264Error = viewModel.h264Error,
+                                        h264Frames = viewModel.h264Frames,
                                         selectedRowHwnd = viewModel.selectedRowHwnd.value,
                                         onSwitch = { viewModel.switchWindow(it) },
                                         onRowPageChange = { viewModel.rememberRowWindow(it) },
@@ -451,9 +466,13 @@ fun CarouselPagerMode(
     containerColor: Color,
     containerAlpha: Float,
     showPreviews: Boolean,
+    useHardwareEncoding: Boolean,
     clipLivePreview: Boolean,
     livePreviewCornerPx: Int,
     focusedLiveFrame: State<ByteArray?>,
+    h264VideoConfig: State<H264VideoConfig?>,
+    h264Error: State<String?>,
+    h264Frames: SharedFlow<ByteArray>,
     selectedRowHwnd: Long?,
     // Removed the maxWidth parameter here
     onSwitch: (Long) -> Unit,
@@ -501,7 +520,11 @@ fun CarouselPagerMode(
                         accentColor = accentColor,
                         containerColor = previewContainerColor,
                         clipPreview = clipLivePreview,
-                        cornerPx = livePreviewCornerPx
+                        cornerPx = livePreviewCornerPx,
+                        useHardwareEncoding = useHardwareEncoding,
+                        h264VideoConfig = h264VideoConfig,
+                        h264Error = h264Error,
+                        h264Frames = h264Frames
                     )
                 }
             }
@@ -570,9 +593,13 @@ fun LandscapeSingleMode(
     containerAlpha: Float,
     showTitles: Boolean,
     showPreviews: Boolean,
+    useHardwareEncoding: Boolean,
     clipLivePreview: Boolean,
     livePreviewCornerPx: Int,
     focusedLiveFrame: State<ByteArray?>,
+    h264VideoConfig: State<H264VideoConfig?>,
+    h264Error: State<String?>,
+    h264Frames: SharedFlow<ByteArray>,
     inputStatus: String?,
     onDismissInputStatus: () -> Unit,
     selectedRowHwnd: Long?,
@@ -600,8 +627,12 @@ fun LandscapeSingleMode(
     val currentWindow = windows.firstOrNull { it.hwnd == selectedRowHwnd }
         ?: windows.firstOrNull { it.is_active }
         ?: windows.first()
-    val liveBitmapState = rememberLiveBitmapFrame(focusedLiveFrame, currentWindow.hwnd)
-    val liveFrameSize = liveBitmapState.value?.let { it.width to it.height }
+    val liveBitmapState = if (useHardwareEncoding) null else rememberLiveBitmapFrame(focusedLiveFrame, currentWindow.hwnd)
+    val liveFrameSize = if (useHardwareEncoding) {
+        h264VideoConfig.value?.let { it.width to it.height }
+    } else {
+        liveBitmapState?.value?.let { it.width to it.height }
+    }
 
     LaunchedEffect(currentWindow.hwnd, showPreviews, rightPanelMode) {
         onRowPageChange(currentWindow.hwnd)
@@ -704,7 +735,11 @@ fun LandscapeSingleMode(
                                     containerColor = previewContainerColor,
                                     clipPreview = clipLivePreview,
                                     cornerPx = livePreviewCornerPx,
-                                    decodedBitmap = liveBitmapState.value
+                                    decodedBitmap = liveBitmapState?.value,
+                                    useHardwareEncoding = useHardwareEncoding,
+                                    h264VideoConfig = h264VideoConfig,
+                                    h264Error = h264Error,
+                                    h264Frames = h264Frames
                                 )
                             } else {
                                 IconContainer(
@@ -1070,8 +1105,45 @@ fun LivePreviewContainer(
     containerColor: Color,
     clipPreview: Boolean,
     cornerPx: Int,
-    decodedBitmap: Bitmap? = null
+    decodedBitmap: Bitmap? = null,
+    useHardwareEncoding: Boolean = false,
+    h264VideoConfig: State<H264VideoConfig?>? = null,
+    h264Error: State<String?>? = null,
+    h264Frames: SharedFlow<ByteArray>? = null
 ) {
+    if (useHardwareEncoding) {
+        val error = h264Error?.value
+        if (!error.isNullOrBlank()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(18.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = error,
+                    color = MaterialTheme.colorScheme.error,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center
+                )
+            }
+            return
+        }
+        val config = h264VideoConfig?.value
+        if (config != null && h264Frames != null) {
+            H264PreviewContainer(
+                config = config,
+                frames = h264Frames,
+                title = currentWindow.title,
+                clipPreview = clipPreview,
+                cornerPx = cornerPx
+            )
+            return
+        }
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("Starting H.264...", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f), fontSize = 12.sp)
+        }
+        return
+    }
+
     val bitmap by if (decodedBitmap != null) {
         remember(decodedBitmap) { mutableStateOf(decodedBitmap) }
     } else {
@@ -1119,5 +1191,134 @@ fun LivePreviewContainer(
                 shape = RoundedCornerShape(24.dp)
             )
         }
+    }
+}
+
+@Composable
+fun H264PreviewContainer(
+    config: H264VideoConfig,
+    frames: SharedFlow<ByteArray>,
+    title: String,
+    clipPreview: Boolean,
+    cornerPx: Int
+) {
+    var surface by remember { mutableStateOf<Surface?>(null) }
+    val density = LocalDensity.current
+    val previewShape = if (clipPreview) {
+        RoundedCornerShape(with(density) { cornerPx.coerceAtLeast(0).toDp() })
+    } else {
+        RoundedCornerShape(0.dp)
+    }
+
+    LaunchedEffect(surface, config) {
+        val targetSurface = surface ?: return@LaunchedEffect
+        val codec = MediaCodec.createDecoderByType("video/avc")
+        val parser = AnnexBNalParser()
+        val bufferInfo = MediaCodec.BufferInfo()
+        var ptsUs = 0L
+        fun drainOutput() {
+            var outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+            while (outputIndex >= 0) {
+                codec.releaseOutputBuffer(outputIndex, true)
+                outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+            }
+        }
+        try {
+            val format = MediaFormat.createVideoFormat("video/avc", config.width, config.height)
+            codec.configure(format, targetSurface, null, 0)
+            codec.start()
+            frames.collect { chunk ->
+                parser.push(chunk).forEach { nal ->
+                    drainOutput()
+                    var inputIndex = codec.dequeueInputBuffer(20_000)
+                    var attempts = 0
+                    while (inputIndex < 0 && attempts < 4) {
+                        drainOutput()
+                        inputIndex = codec.dequeueInputBuffer(20_000)
+                        attempts++
+                    }
+                    if (inputIndex < 0) return@forEach
+                    val inputBuffer = codec.getInputBuffer(inputIndex)
+                    inputBuffer?.clear()
+                    if (inputBuffer != null && nal.size <= inputBuffer.capacity()) {
+                        inputBuffer.put(nal)
+                        codec.queueInputBuffer(inputIndex, 0, nal.size, ptsUs, 0)
+                        ptsUs += 16_666L
+                    }
+                    drainOutput()
+                }
+            }
+        } finally {
+            runCatching { codec.stop() }
+            runCatching { codec.release() }
+        }
+    }
+
+    BoxWithConstraints(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        val imageAspect = config.width.toFloat() / config.height.toFloat().coerceAtLeast(1f)
+        val containerAspect = maxWidth.value / maxHeight.value.coerceAtLeast(1f)
+        val imageWidth = if (containerAspect > imageAspect) maxHeight * imageAspect else maxWidth
+        val imageHeight = if (containerAspect > imageAspect) maxHeight else maxWidth / imageAspect
+
+        AndroidView(
+            factory = { context ->
+                SurfaceView(context).apply {
+                    holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(holder: SurfaceHolder) {
+                            surface = holder.surface
+                        }
+
+                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                            surface = holder.surface
+                        }
+
+                        override fun surfaceDestroyed(holder: SurfaceHolder) {
+                            surface = null
+                        }
+                    })
+                }
+            },
+            modifier = Modifier
+                .width(imageWidth)
+                .height(imageHeight)
+                .clip(previewShape),
+            update = { it.contentDescription = title }
+        )
+    }
+}
+
+private class AnnexBNalParser {
+    private var buffer = ByteArray(0)
+
+    fun push(chunk: ByteArray): List<ByteArray> {
+        if (chunk.isEmpty()) return emptyList()
+        buffer += chunk
+        val starts = findStartCodes(buffer)
+        if (starts.size < 2) return emptyList()
+        val out = ArrayList<ByteArray>(starts.size - 1)
+        for (i in 0 until starts.lastIndex) {
+            val start = starts[i]
+            val end = starts[i + 1]
+            if (end > start) out.add(buffer.copyOfRange(start, end))
+        }
+        buffer = buffer.copyOfRange(starts.last(), buffer.size)
+        return out
+    }
+
+    private fun findStartCodes(data: ByteArray): List<Int> {
+        val result = ArrayList<Int>()
+        var i = 0
+        while (i < data.size - 3) {
+            val threeByte = data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()
+            val fourByte = i < data.size - 4 && data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
+                data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()
+            if (threeByte || fourByte) {
+                result.add(i)
+                i += if (fourByte) 4 else 3
+            } else {
+                i++
+            }
+        }
+        return result
     }
 }
