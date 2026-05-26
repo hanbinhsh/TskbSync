@@ -250,30 +250,75 @@ class BackendTray:
     def _autostart_command(self):
         return f'"{self._python_windowless_exe()}" "{os.path.abspath(__file__)}"'
 
-    def is_autostart_enabled(self):
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
-                value, _ = winreg.QueryValueEx(key, AUTOSTART_NAME)
-            return value == self._autostart_command()
-        except FileNotFoundError:
-            return False
-
-    def toggle_autostart(self):
+    def _cleanup_legacy_autostart(self):
         run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
-            if self.is_autostart_enabled():
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
                 try:
                     winreg.DeleteValue(key, AUTOSTART_NAME)
                 except FileNotFoundError:
                     pass
+        except Exception as e:
+            tray_log(f"legacy autostart cleanup failed: {e}")
+
+    def is_autostart_enabled(self):
+        try:
+            result = subprocess.run(
+                ["schtasks", "/Query", "/TN", AUTOSTART_NAME],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def toggle_autostart(self):
+        self._cleanup_legacy_autostart()
+        try:
+            if self.is_autostart_enabled():
+                subprocess.run(
+                    ["schtasks", "/Delete", "/TN", AUTOSTART_NAME, "/F"],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
             else:
-                winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, self._autostart_command())
+                subprocess.run(
+                    [
+                        "schtasks",
+                        "/Create",
+                        "/TN",
+                        AUTOSTART_NAME,
+                        "/SC",
+                        "ONLOGON",
+                        "/TR",
+                        self._autostart_command(),
+                        "/RL",
+                        "HIGHEST",
+                        "/F",
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+        except Exception as e:
+            tray_log(f"autostart toggle failed: {e}")
+            win32gui.MessageBox(
+                self.hwnd,
+                "Autostart needs administrator permission. Start the tray with start_tray.bat and accept the UAC prompt.",
+                APP_NAME,
+                win32con.MB_ICONERROR,
+            )
 
     def show_menu(self):
         pos = win32gui.GetCursorPos()
         tray_log(f"show native menu at {pos}")
         menu = win32gui.CreatePopupMenu()
-        autostart_text = "Disable Autostart" if self.is_autostart_enabled() else "Enable Autostart"
+        autostart_text = "Disable Admin Autostart" if self.is_autostart_enabled() else "Enable Admin Autostart"
         win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_OPEN_LOGS, "Open Console Logs")
         win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_RESTART, "Restart Service")
         win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_AUTOSTART, autostart_text)
