@@ -813,6 +813,21 @@ WINDOW_FILTER_CONFIG = {
     "process_names": [],
     "class_names": [],
 }
+VIRTUAL_DISPLAY_MATCH_TOKENS = [
+    "virtual display driver",
+    "iddsampledriver",
+    "parsec",
+    "virtualdisplay",
+    "virtual display",
+    "vdd",
+]
+EXTENDED_DISPLAY_BINDING = {
+    "client_id": "",
+    "device": "",
+    "monitor_index": 0,
+}
+PNP_DISPLAY_ENUM_ERROR = ""
+LAST_VIRTUAL_PNP_DEVICE = None
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -1100,6 +1115,206 @@ def enumerate_dxgi_outputs():
         _release_com(factory)
     return outputs
 
+def get_display_devices():
+    devices = []
+    try:
+        index = 0
+        while True:
+            try:
+                device = win32api.EnumDisplayDevices(None, index)
+            except Exception:
+                break
+            monitor_strings = []
+            monitor_ids = []
+            monitor_index = 0
+            while True:
+                try:
+                    monitor = win32api.EnumDisplayDevices(device.DeviceName, monitor_index)
+                except Exception:
+                    break
+                monitor_strings.append(str(getattr(monitor, "DeviceString", "") or ""))
+                monitor_ids.append(str(getattr(monitor, "DeviceID", "") or ""))
+                monitor_index += 1
+            devices.append({
+                "device": str(getattr(device, "DeviceName", "") or ""),
+                "name": str(getattr(device, "DeviceString", "") or ""),
+                "id": str(getattr(device, "DeviceID", "") or ""),
+                "state": int(getattr(device, "StateFlags", 0) or 0),
+                "monitors": monitor_strings,
+                "monitor_ids": monitor_ids,
+            })
+            index += 1
+    except Exception as e:
+        print(f"[extended] display device enumerate failed: {type(e).__name__}: {e}", flush=True)
+    return devices
+
+def is_virtual_display_device(device: dict):
+    haystack = " ".join([
+        str(device.get("device", "")),
+        str(device.get("name", "")),
+        str(device.get("id", "")),
+        " ".join(device.get("monitors", []) or []),
+        " ".join(device.get("monitor_ids", []) or []),
+    ]).lower()
+    return any(token in haystack for token in VIRTUAL_DISPLAY_MATCH_TOKENS)
+
+def get_display_device_map():
+    return {str(device.get("device", "")).lower(): device for device in get_display_devices()}
+
+def is_process_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+def run_powershell_json(script: str, timeout: float = 8.0):
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh.exe") or shutil.which("pwsh")
+    if not powershell:
+        raise RuntimeError("PowerShell was not found")
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0:
+        message = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(message or f"PowerShell exited with {completed.returncode}")
+    output = (completed.stdout or "").strip()
+    if not output:
+        return None
+    return json.loads(output)
+
+def normalize_pnp_device(raw):
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        "friendly_name": str(raw.get("FriendlyName") or raw.get("Name") or ""),
+        "instance_id": str(raw.get("InstanceId") or raw.get("InstanceID") or ""),
+        "status": str(raw.get("Status") or ""),
+        "class": str(raw.get("Class") or ""),
+        "present": bool(raw.get("Present", False)),
+    }
+
+def parse_pnp_devices(data):
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    return [normalize_pnp_device(item) for item in data if isinstance(item, dict)]
+
+def get_pnp_display_devices():
+    global PNP_DISPLAY_ENUM_ERROR
+    PNP_DISPLAY_ENUM_ERROR = ""
+    display_script = (
+        "Get-PnpDevice -Class Display | "
+        "Select-Object FriendlyName,InstanceId,Status,Class,Present | "
+        "ConvertTo-Json -Compress"
+    )
+    try:
+        data = run_powershell_json(display_script)
+    except Exception as e:
+        PNP_DISPLAY_ENUM_ERROR = str(e)
+        print(f"[extended] pnp display enumerate failed: {type(e).__name__}: {e}", flush=True)
+        return []
+    devices = parse_pnp_devices(data)
+    if any(is_virtual_pnp_device(device) for device in devices):
+        return devices
+
+    fallback_script = (
+        "$rx='Virtual Display Driver|IddSampleDriver|VirtualDisplay|Virtual Display|VDD'; "
+        "Get-PnpDevice | Where-Object { "
+        "($_.FriendlyName -match $rx) -or ($_.InstanceId -match $rx) "
+        "} | Select-Object FriendlyName,InstanceId,Status,Class,Present | ConvertTo-Json -Compress"
+    )
+    try:
+        return devices + parse_pnp_devices(run_powershell_json(fallback_script, timeout=12.0))
+    except Exception as e:
+        PNP_DISPLAY_ENUM_ERROR = str(e)
+        print(f"[extended] pnp fallback enumerate failed: {type(e).__name__}: {e}", flush=True)
+        return devices
+
+def is_virtual_pnp_device(device: dict):
+    haystack = " ".join([
+        str(device.get("friendly_name", "")),
+        str(device.get("instance_id", "")),
+        str(device.get("status", "")),
+    ]).lower()
+    return any(token in haystack for token in VIRTUAL_DISPLAY_MATCH_TOKENS)
+
+def get_virtual_pnp_device():
+    global LAST_VIRTUAL_PNP_DEVICE
+    devices = [device for device in get_pnp_display_devices() if is_virtual_pnp_device(device)]
+    deduped = {}
+    for device in devices:
+        key = str(device.get("instance_id", "")).lower()
+        if key:
+            deduped[key] = device
+    devices = list(deduped.values()) if deduped else devices
+    devices.sort(key=lambda d: (
+        0 if str(d.get("status", "")).lower() == "ok" else 1,
+        str(d.get("friendly_name", "")).lower(),
+    ))
+    if devices:
+        LAST_VIRTUAL_PNP_DEVICE = devices[0]
+        return devices[0]
+    return LAST_VIRTUAL_PNP_DEVICE
+
+def pnp_device_enabled(device: dict | None):
+    if not device:
+        return False
+    return str(device.get("status", "")).strip().lower() == "ok"
+
+def set_pnp_device_enabled(instance_id: str, enabled: bool):
+    if not instance_id:
+        raise RuntimeError("missing PnP device instance id")
+    escaped = instance_id.replace("'", "''")
+    command = "Enable-PnpDevice" if enabled else "Disable-PnpDevice"
+    script = (
+        f"{command} -InstanceId '{escaped}' -Confirm:$false -ErrorAction Stop; "
+        "Start-Sleep -Milliseconds 300; "
+        "Get-PnpDevice -InstanceId '{0}' | "
+        "Select-Object FriendlyName,InstanceId,Status,Class,Present | "
+        "ConvertTo-Json -Compress"
+    ).format(escaped)
+    data = run_powershell_json(script, timeout=20.0)
+    return normalize_pnp_device(data) if isinstance(data, dict) else {}
+
+def get_supported_display_modes(device_name: str, limit: int = 80):
+    modes = []
+    seen = set()
+    index = 0
+    while index < 512:
+        try:
+            mode = win32api.EnumDisplaySettings(device_name, index)
+        except Exception:
+            break
+        width = int(getattr(mode, "PelsWidth", 0) or 0)
+        height = int(getattr(mode, "PelsHeight", 0) or 0)
+        fps = int(getattr(mode, "DisplayFrequency", 0) or 0)
+        if width > 0 and height > 0:
+            key = (width, height, fps)
+            if key not in seen:
+                seen.add(key)
+                modes.append({"width": width, "height": height, "fps": fps})
+        index += 1
+    modes.sort(key=lambda m: (m["width"] * m["height"], m["fps"], m["width"], m["height"]), reverse=True)
+    return modes[:limit]
+
+def get_current_display_mode(device_name: str):
+    try:
+        mode = win32api.EnumDisplaySettings(device_name, win32con.ENUM_CURRENT_SETTINGS)
+        return {
+            "width": int(getattr(mode, "PelsWidth", 0) or 0),
+            "height": int(getattr(mode, "PelsHeight", 0) or 0),
+            "fps": int(getattr(mode, "DisplayFrequency", 0) or 0),
+        }
+    except Exception:
+        return None
+
 def get_screens_list():
     screens = []
     try:
@@ -1107,6 +1322,7 @@ def get_screens_list():
         dxgi_outputs = enumerate_dxgi_outputs()
         dxgi_by_hmonitor = {int(item["hmonitor"]): item for item in dxgi_outputs if int(item.get("hmonitor") or 0)}
         dxgi_by_device = {str(item["device"]).lower(): item for item in dxgi_outputs if item.get("device")}
+        display_devices = get_display_device_map()
         primary_rect = (
             user32.GetSystemMetrics(0),
             user32.GetSystemMetrics(1),
@@ -1119,6 +1335,8 @@ def get_screens_list():
             is_primary = bool(info.get("Flags", 0) & 1)
             device = info.get("Device", f"Monitor {idx}")
             dxgi_output = dxgi_by_hmonitor.get(int(handle)) or dxgi_by_device.get(str(device).lower())
+            display_device = display_devices.get(str(device).lower(), {})
+            is_virtual = is_virtual_display_device(display_device) if display_device else False
             screens.append({
                 "monitor_index": idx,
                 "ddagrab_adapter_idx": int(dxgi_output["adapter_idx"]) if dxgi_output else 0,
@@ -1138,6 +1356,11 @@ def get_screens_list():
                 "width": int(right - left),
                 "height": int(bottom - top),
                 "is_primary": is_primary,
+                "is_virtual": is_virtual,
+                "virtual_driver": display_device.get("name", "") if is_virtual else "",
+                "extended_owner": EXTENDED_DISPLAY_BINDING.get("client_id", "") if (
+                    is_virtual and EXTENDED_DISPLAY_BINDING.get("device", "").lower() == str(device).lower()
+                ) else "",
                 "work_left": int(work[0]),
                 "work_top": int(work[1]),
                 "work_right": int(work[2]),
@@ -1635,6 +1858,225 @@ async def set_window_filter(request: Request):
 async def screens_endpoint():
     return get_screens_list()
 
+def _authorized_request(request: Request):
+    return request.headers.get("password") == PASSWORD
+
+def get_extended_display_status_payload():
+    screens = get_screens_list()
+    virtual_screens = [screen for screen in screens if bool(screen.get("is_virtual"))]
+    virtual_devices = [device for device in get_display_devices() if is_virtual_display_device(device)]
+    pnp_device = get_virtual_pnp_device()
+    admin = is_process_admin()
+    pnp_error = PNP_DISPLAY_ENUM_ERROR
+    pnp_access_denied = "denied" in pnp_error.lower() or "拒绝访问" in pnp_error
+    bound_device = str(EXTENDED_DISPLAY_BINDING.get("device", "") or "")
+    bound_screen = next((screen for screen in virtual_screens if str(screen.get("device", "")).lower() == bound_device.lower()), None)
+    if not bound_screen and EXTENDED_DISPLAY_BINDING.get("monitor_index"):
+        bound_screen = next((screen for screen in virtual_screens if int(screen.get("monitor_index", 0)) == int(EXTENDED_DISPLAY_BINDING["monitor_index"])), None)
+    current_mode = get_current_display_mode(bound_screen["device"]) if bound_screen else None
+    supported_modes = get_supported_display_modes(bound_screen["device"], limit=32) if bound_screen else []
+    available = bool(virtual_screens)
+    driver_enabled = pnp_device_enabled(pnp_device) or available
+    driver_status = str(pnp_device.get("status", "")) if pnp_device else ""
+    if not driver_enabled and not available and pnp_device:
+        driver_status = "Disabled"
+    if available:
+        message = "Virtual display ready"
+    elif pnp_access_denied:
+        message = "Run the PC backend as administrator to query or control the virtual display driver"
+    elif pnp_device and not driver_enabled:
+        message = "Virtual display driver is disabled"
+    elif virtual_devices or pnp_device:
+        message = "Virtual display driver found, but no active virtual monitor is attached"
+    else:
+        message = "No compatible virtual display driver was found"
+    return {
+        "available": available,
+        "message": message,
+        "driver_control_available": bool(pnp_device) or bool(virtual_devices) or pnp_access_denied,
+        "driver_enabled": bool(driver_enabled),
+        "requires_admin": (bool(pnp_device) and not admin) or pnp_access_denied,
+        "is_admin": admin,
+        "driver_instance_id": str(pnp_device.get("instance_id", "")) if pnp_device else "",
+        "driver_status": driver_status,
+        "driver_name": str(pnp_device.get("friendly_name", "")) if pnp_device else "",
+        "driver_error": pnp_error,
+        "bound_client_id": EXTENDED_DISPLAY_BINDING.get("client_id", "") if bound_screen else "",
+        "monitor_index": int(bound_screen.get("monitor_index", 0)) if bound_screen else 0,
+        "screen": bound_screen,
+        "current_mode": current_mode,
+        "supported_modes": supported_modes,
+        "virtual_devices": virtual_devices,
+        "pnp_device": pnp_device,
+    }
+
+@app.get("/extended_display/status")
+async def extended_display_status(request: Request):
+    if not _authorized_request(request):
+        return JSONResponse(status_code=401, content={"message": "Invalid password"})
+    return await asyncio.to_thread(get_extended_display_status_payload)
+
+@app.post("/extended_display/connect")
+async def extended_display_connect(request: Request):
+    if not _authorized_request(request):
+        return JSONResponse(status_code=401, content={"message": "Invalid password"})
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    client_id = str(data.get("client_id", "")).strip()
+    if not client_id:
+        raise HTTPException(status_code=400, detail="client_id is required")
+
+    screens = get_screens_list()
+    virtual_screens = [screen for screen in screens if bool(screen.get("is_virtual"))]
+    if not virtual_screens:
+        virtual_devices = [device for device in get_display_devices() if is_virtual_display_device(device)]
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "missing",
+                "message": "No active compatible virtual display was found" if not virtual_devices else "Virtual display driver found, but no active virtual monitor is attached",
+                "virtual_devices": virtual_devices,
+            },
+        )
+
+    bound_client = str(EXTENDED_DISPLAY_BINDING.get("client_id", "") or "")
+    bound_device = str(EXTENDED_DISPLAY_BINDING.get("device", "") or "")
+    if bound_client and bound_client != client_id:
+        bound_screen = next((screen for screen in virtual_screens if str(screen.get("device", "")).lower() == bound_device.lower()), None)
+        if bound_screen:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "busy",
+                    "message": "Extended display is already bound to another client",
+                    "monitor_index": int(bound_screen.get("monitor_index", 0)),
+                    "screen": bound_screen,
+                },
+            )
+
+    selected = next((screen for screen in virtual_screens if str(screen.get("device", "")).lower() == bound_device.lower()), None)
+    if not selected:
+        selected = virtual_screens[0]
+
+    screens = get_screens_list()
+    selected = next((screen for screen in screens if str(screen.get("device", "")).lower() == str(selected["device"]).lower()), selected)
+    EXTENDED_DISPLAY_BINDING["client_id"] = client_id
+    EXTENDED_DISPLAY_BINDING["device"] = str(selected.get("device", ""))
+    EXTENDED_DISPLAY_BINDING["monitor_index"] = int(selected.get("monitor_index", 0))
+    selected["extended_owner"] = client_id
+    return {
+        "status": "connected",
+        "message": "Virtual display bound",
+        "monitor_index": int(selected.get("monitor_index", 0)),
+        "screen": selected,
+        "current_mode": get_current_display_mode(selected["device"]),
+    }
+
+@app.post("/extended_display/disconnect")
+async def extended_display_disconnect(request: Request):
+    if not _authorized_request(request):
+        return JSONResponse(status_code=401, content={"message": "Invalid password"})
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    client_id = str(data.get("client_id", "")).strip()
+    if not client_id or EXTENDED_DISPLAY_BINDING.get("client_id") == client_id:
+        EXTENDED_DISPLAY_BINDING["client_id"] = ""
+        EXTENDED_DISPLAY_BINDING["device"] = ""
+        EXTENDED_DISPLAY_BINDING["monitor_index"] = 0
+    return {"status": "disconnected", "message": "binding cleared; virtual display was left enabled"}
+
+@app.post("/extended_display/driver_state")
+async def extended_display_driver_state(request: Request):
+    if not _authorized_request(request):
+        return JSONResponse(status_code=401, content={"message": "Invalid password"})
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    return await asyncio.to_thread(set_extended_display_driver_state_payload, data)
+
+def set_extended_display_driver_state_payload(data: dict):
+    enabled = bool(data.get("enabled", False))
+    client_id = str(data.get("client_id", "")).strip()
+    pnp_device = get_virtual_pnp_device()
+    pnp_error = PNP_DISPLAY_ENUM_ERROR
+    pnp_access_denied = "denied" in pnp_error.lower() or "拒绝访问" in pnp_error
+    if pnp_access_denied and not is_process_admin():
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "requires_admin",
+                "message": "Run the PC backend as administrator to enable or disable the virtual display driver",
+                "driver_error": pnp_error,
+            },
+        )
+    if not pnp_device:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "missing_driver", "message": "No compatible virtual display driver was found"},
+        )
+    if not is_process_admin():
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "requires_admin",
+                "message": "Run the PC backend as administrator to enable or disable the virtual display driver",
+                "driver_name": pnp_device.get("friendly_name", ""),
+                "driver_status": pnp_device.get("status", ""),
+            },
+        )
+
+    if pnp_device_enabled(pnp_device) == enabled:
+        status = get_extended_display_status_payload()
+        status["status"] = "enabled" if enabled else "disabled"
+        status["message"] = "Virtual display driver already enabled" if enabled else "Virtual display driver already disabled"
+        return status
+
+    try:
+        updated_device = set_pnp_device_enabled(str(pnp_device.get("instance_id", "")), enabled)
+    except Exception as e:
+        print(f"[extended] set driver enabled={enabled} command failed: {type(e).__name__}: {e}", flush=True)
+        deadline = time.perf_counter() + 3.0
+        status = get_extended_display_status_payload()
+        while time.perf_counter() < deadline:
+            driver_matches = bool(status.get("driver_enabled")) == enabled
+            screen_matches = bool(status.get("available")) == enabled
+            if driver_matches or screen_matches:
+                status["status"] = "enabled" if enabled else "disabled"
+                status["message"] = "Virtual display driver enabled" if enabled else "Virtual display driver disabled"
+                status["driver_warning"] = f"{type(e).__name__}: {e}"
+                return status
+            time.sleep(0.2)
+            status = get_extended_display_status_payload()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "failed", "message": f"{type(e).__name__}: {e}"},
+        )
+
+    if not enabled:
+        bound_client = str(EXTENDED_DISPLAY_BINDING.get("client_id", "") or "")
+        if not client_id or bound_client == client_id:
+            EXTENDED_DISPLAY_BINDING["client_id"] = ""
+            EXTENDED_DISPLAY_BINDING["device"] = ""
+            EXTENDED_DISPLAY_BINDING["monitor_index"] = 0
+
+    deadline = time.perf_counter() + 2.0
+    status = get_extended_display_status_payload()
+    while time.perf_counter() < deadline:
+        if bool(status.get("driver_enabled")) == enabled:
+            if not enabled or status.get("available"):
+                break
+        time.sleep(0.2)
+        status = get_extended_display_status_payload()
+    status["status"] = "enabled" if enabled else "disabled"
+    status["message"] = "Virtual display driver enabled" if enabled else "Virtual display driver disabled"
+    status["pnp_device"] = updated_device or status.get("pnp_device")
+    return status
+
 @app.websocket("/input/{hwnd}")
 async def input_endpoint(websocket: WebSocket, hwnd: int):
     await websocket.accept()
@@ -1689,7 +2131,11 @@ async def input_screen_endpoint(websocket: WebSocket, monitor_index: int):
             await websocket.send_text(json.dumps({"type": "error", "message": "auth failed"}))
             await safe_close(websocket)
             return
-        screen = get_screen_rect(monitor_index)
+        try:
+            screen = get_screen_rect(monitor_index)
+        except Exception as e:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+            return
         print(f"[input] connected screen={monitor_index} rect={screen}", flush=True)
         await websocket.send_text(json.dumps({"type": "status", "message": f"screen input connected {monitor_index}"}))
 
@@ -2747,7 +3193,11 @@ async def live_h264_screen_stream_endpoint(
     await websocket.accept()
     active_live_streams += 1
     try:
-        _ = get_screen_rect(monitor_index)
+        try:
+            _ = get_screen_rect(monitor_index)
+        except Exception as e:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+            return
         stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 3840)))
         stream_quality = max(35, min(quality if quality is not None else LIVE_JPEG_QUALITY, 100))
         stream_fps = float(max(5, min(fps if fps is not None else int(LIVE_TARGET_FPS), 160)))
@@ -2788,6 +3238,14 @@ async def live_h264_screen_stream_endpoint(
             return
         print(f"[h264] ddagrab unavailable screen={monitor_index}: selected encoder={encoder or 'none'}; using WGC jpeg-compatible screen path", flush=True)
         await stream_h264_capture(websocket, WindowsCapture(monitor_index=monitor_index, draw_border=False), f"screen={monitor_index}", stream_max_dim, stream_fps, stream_quality)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[h264] screen stream failed monitor={monitor_index}: {type(e).__name__}: {e}", flush=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        except Exception:
+            pass
     finally:
         active_live_streams = max(0, active_live_streams - 1)
         await safe_close(websocket)

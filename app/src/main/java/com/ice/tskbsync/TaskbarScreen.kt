@@ -98,6 +98,8 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val lastSyncTime by viewModel.lastSyncTime
     val inputStatus by viewModel.inputStatus
     val screens by viewModel.screens
+    val extendedDisplayStatus by viewModel.extendedDisplayStatus
+    val extendedDisplayConnecting by viewModel.extendedDisplayConnecting
 
     val accentColor = Color(theme.color)
     val titleColor = Color(theme.titleColor)
@@ -122,6 +124,15 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
     LaunchedEffect(isLandscapeSingleMode, layoutMode, theme.showPreviews) {
         if (!theme.showPreviews || (!isLandscapeSingleMode && layoutMode == "grid")) {
             viewModel.stopLiveStream()
+        }
+    }
+
+    LaunchedEffect(screens, selectedScreenIndex) {
+        val selected = selectedScreenIndex
+        if (selected != null && screens.none { it.monitor_index == selected }) {
+            selectedScreenIndex = null
+            viewModel.stopLiveStream()
+            viewModel.stopRemoteInput()
         }
     }
 
@@ -351,6 +362,9 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     rightPanelMode = rightPanelMode,
                                     screens = screens,
                                     selectedScreenIndex = selectedScreenIndex,
+                                    showVirtualDisplayButton = theme.showVirtualDisplayButton,
+                                    extendedDisplayStatus = extendedDisplayStatus,
+                                    extendedDisplayConnecting = extendedDisplayConnecting,
                                     inputMode = landscapeInputMode,
                                     onToggleMouseMode = {
                                         rightPanelMode = if (rightPanelMode == "mouse") null else "mouse"
@@ -360,12 +374,21 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         rightPanelMode = next
                                         if (next == "screen") {
                                             viewModel.fetchScreens()
+                                            viewModel.fetchExtendedDisplayStatus()
                                         }
                                     },
                                     onScreenSelected = { screen ->
                                         selectedScreenIndex = screen.monitor_index
                                         viewModel.startLiveScreenStream(screen.monitor_index)
                                         viewModel.startRemoteScreenInput(screen.monitor_index)
+                                    },
+                                    onExtendDisplay = {
+                                        viewModel.connectExtendedDisplay { screen ->
+                                            selectedScreenIndex = screen.monitor_index
+                                            viewModel.fetchScreens()
+                                            viewModel.startLiveScreenStream(screen.monitor_index)
+                                            viewModel.startRemoteScreenInput(screen.monitor_index)
+                                        }
                                     },
                                     onMouseLeftClick = { viewModel.sendMouseButtonClick("left") },
                                     onMouseMiddleClick = { viewModel.sendMouseButtonClick("middle") },
@@ -626,10 +649,14 @@ fun LandscapeSingleMode(
     rightPanelMode: String?,
     screens: List<ScreenInfo>,
     selectedScreenIndex: Int?,
+    showVirtualDisplayButton: Boolean,
+    extendedDisplayStatus: ExtendedDisplayStatus?,
+    extendedDisplayConnecting: Boolean,
     inputMode: String,
     onToggleMouseMode: () -> Unit,
     onToggleScreenMode: () -> Unit,
     onScreenSelected: (ScreenInfo) -> Unit,
+    onExtendDisplay: () -> Unit,
     onMouseLeftClick: () -> Unit,
     onMouseMiddleClick: () -> Unit,
     onMouseRightClick: () -> Unit,
@@ -722,6 +749,7 @@ fun LandscapeSingleMode(
                                         var lastX = startX
                                         var lastY = startY
                                         var moved = false
+                                        var lastTouchSentAt = 0L
                                         if (inputMode == "touch") {
                                             onMultiTouchInput(
                                                 listOf(
@@ -734,6 +762,7 @@ fun LandscapeSingleMode(
                                                     )
                                                 )
                                             )
+                                            lastTouchSentAt = android.os.SystemClock.uptimeMillis()
                                         } else {
                                             onMouseInput("move", startX, startY)
                                         }
@@ -744,6 +773,7 @@ fun LandscapeSingleMode(
                                             val (x, y) = normalizedInPreview(change.position.x, change.position.y)
                                             if (abs(x - startX) > 0.006f || abs(y - startY) > 0.006f) moved = true
                                             if (inputMode == "touch") {
+                                                val now = android.os.SystemClock.uptimeMillis()
                                                 val points = event.changes.mapNotNull { pointer ->
                                                     if (!pointer.pressed && !pointer.previousPressed) return@mapNotNull null
                                                     val (px, py) = normalizedInPreview(pointer.position.x, pointer.position.y)
@@ -761,7 +791,11 @@ fun LandscapeSingleMode(
                                                         primary = pointer.id == down.id
                                                     )
                                                 }
-                                                onMultiTouchInput(points)
+                                                val hasDownOrUp = points.any { it.action != "move" }
+                                                if (hasDownOrUp || now - lastTouchSentAt >= 8L) {
+                                                    onMultiTouchInput(points)
+                                                    lastTouchSentAt = now
+                                                }
                                             } else if (change.pressed) {
                                                 onMouseInput("move", x, y)
                                             } else {
@@ -954,6 +988,44 @@ fun LandscapeSingleMode(
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                         if (rightPanelMode == "screen") {
+                            val extendedMonitorIndex = extendedDisplayStatus?.monitor_index?.takeIf { it > 0 }
+                            val extendLabel = when {
+                                extendedDisplayConnecting -> "Preparing..."
+                                extendedMonitorIndex != null -> "Connected Display $extendedMonitorIndex"
+                                extendedDisplayStatus?.available == false && !extendedDisplayStatus.message.contains("status failed", ignoreCase = true) -> "Driver missing"
+                                extendedDisplayStatus?.bound_client_id?.isNotBlank() == true -> "Busy"
+                                else -> "Use Virtual Display"
+                            }
+                            if (showVirtualDisplayButton) {
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = accentColor.copy(alpha = 0.12f),
+                                    border = BorderStroke(1.dp, accentColor.copy(alpha = 0.55f)),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable(enabled = !extendedDisplayConnecting) { onExtendDisplay() }
+                                ) {
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
+                                    ) {
+                                        Icon(
+                                            if (extendedDisplayConnecting) Icons.Default.Sync else Icons.Default.Add,
+                                            null,
+                                            tint = accentColor,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Text(
+                                            extendLabel,
+                                            fontSize = 10.sp,
+                                            color = titleColor,
+                                            textAlign = TextAlign.Center,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
                             if (screens.isEmpty()) {
                                 Text(
                                     "No screens",

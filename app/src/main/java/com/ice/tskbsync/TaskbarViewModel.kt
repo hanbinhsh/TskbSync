@@ -2,6 +2,8 @@ package com.ice.tskbsync
 
 import android.app.Application
 import android.net.Uri
+import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateMapOf
@@ -33,6 +35,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.util.UUID
 import kotlin.math.roundToLong
 
 data class H264VideoConfig(val width: Int, val height: Int, val fps: Int = 60)
@@ -47,6 +50,9 @@ data class TouchPointInput(
 
 class TaskbarViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsManager = SettingsManager(application)
+    private val clientId: String =
+        Settings.Secure.getString(application.contentResolver, Settings.Secure.ANDROID_ID)
+            ?: UUID.randomUUID().toString()
     private var connectionJob: Job? = null
     private var liveStreamJob: Job? = null
     private var inputJob: Job? = null
@@ -77,7 +83,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _password = mutableStateOf("")
     val password: State<String> = _password
 
-    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, 2000, false, 18))
+    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, true, 2000, false, 18))
     val theme: State<ThemeSettings> = _theme
 
     private val _layoutMode = mutableStateOf("grid")
@@ -118,10 +124,22 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
 
     private var inputWsSession: DefaultClientWebSocketSession? = null
     private var remoteInputTarget: String? = null
+    private var lastMultiTouchSentAt = 0L
+    private var pendingMultiTouchPoints: List<TouchPointInput>? = null
+    private var pendingMultiTouchJob: Job? = null
+    private val multiTouchSendIntervalMs = 8L
 
     val gridPreviewCache = mutableStateMapOf<Long, String>()
     private val _screens = mutableStateOf<List<ScreenInfo>>(emptyList())
     val screens: State<List<ScreenInfo>> = _screens
+    private val _extendedDisplayStatus = mutableStateOf<ExtendedDisplayStatus?>(null)
+    val extendedDisplayStatus: State<ExtendedDisplayStatus?> = _extendedDisplayStatus
+    private val _extendedDisplayConnecting = mutableStateOf(false)
+    val extendedDisplayConnecting: State<Boolean> = _extendedDisplayConnecting
+    private val _extendedDisplayDriverChanging = mutableStateOf(false)
+    val extendedDisplayDriverChanging: State<Boolean> = _extendedDisplayDriverChanging
+    private var activeScreenStreamIndex: Int? = null
+    private var suppressScreenGoneErrorsUntil = 0L
 
     private var activeWsSession: DefaultClientWebSocketSession? = null
     val discoveredServers = mutableStateListOf<String>()
@@ -211,6 +229,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun startLiveStream(hwnd: Long) {
+        activeScreenStreamIndex = null
         _selectedRowHwnd.value = hwnd
         liveStreamJob?.cancel()
         _focusedLiveFrame.value = null
@@ -286,6 +305,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
 
     fun stopLiveStream() {
         liveStreamJob?.cancel()
+        activeScreenStreamIndex = null
         _focusedLiveFrame.value = null
         _h264VideoConfig.value = null
         _h264Error.value = null
@@ -353,7 +373,9 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                 val value = json["message"]?.jsonPrimitive?.content ?: text
                                 if (type == "error") "Input error: $value" else null
                             }.getOrNull()
-                            if (message != null) _inputStatus.value = message
+                            if (message != null && !shouldSuppressScreenGoneError(message)) {
+                                _inputStatus.value = message
+                            }
                         }
                     }
                 }
@@ -361,7 +383,10 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 throw e
             } catch (e: Exception) {
                 Log.e("TaskbarInput", "Screen input failed", e)
-                _inputStatus.value = "Input connection failed: ${e.message ?: e::class.java.simpleName}"
+                val message = "Input connection failed: ${e.message ?: e::class.java.simpleName}"
+                if (!shouldSuppressScreenGoneError(message)) {
+                    _inputStatus.value = message
+                }
             } finally {
                 inputWsSession = null
                 remoteInputTarget = null
@@ -373,10 +398,18 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         inputJob?.cancel()
         inputWsSession = null
         remoteInputTarget = null
+        pendingMultiTouchJob?.cancel()
+        pendingMultiTouchJob = null
+        pendingMultiTouchPoints = null
     }
 
     fun clearInputStatus() {
         _inputStatus.value = null
+    }
+
+    private fun shouldSuppressScreenGoneError(message: String): Boolean {
+        return SystemClock.uptimeMillis() < suppressScreenGoneErrorsUntil &&
+            message.contains("screen not found", ignoreCase = true)
     }
 
     fun sendRemoteInput(payload: JsonObject) {
@@ -435,6 +468,32 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
 
     fun sendMultiTouchInput(points: List<TouchPointInput>) {
         if (points.isEmpty()) return
+        val hasEdgeEvent = points.any { it.action == "down" || it.action == "up" }
+        val now = SystemClock.uptimeMillis()
+        if (hasEdgeEvent || now - lastMultiTouchSentAt >= multiTouchSendIntervalMs) {
+            pendingMultiTouchJob?.cancel()
+            pendingMultiTouchJob = null
+            pendingMultiTouchPoints = null
+            sendMultiTouchInputNow(points)
+            lastMultiTouchSentAt = now
+            return
+        }
+
+        pendingMultiTouchPoints = points
+        if (pendingMultiTouchJob?.isActive == true) return
+        val delayMs = (multiTouchSendIntervalMs - (now - lastMultiTouchSentAt)).coerceAtLeast(1L)
+        pendingMultiTouchJob = viewModelScope.launch {
+            delay(delayMs)
+            val latest = pendingMultiTouchPoints
+            pendingMultiTouchPoints = null
+            if (!latest.isNullOrEmpty()) {
+                sendMultiTouchInputNow(latest)
+                lastMultiTouchSentAt = SystemClock.uptimeMillis()
+            }
+        }
+    }
+
+    private fun sendMultiTouchInputNow(points: List<TouchPointInput>) {
         sendRemoteInput(buildJsonObject {
             put("type", "touch_multi")
             putJsonArray("points") {
@@ -587,6 +646,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun startLiveScreenStream(monitorIndex: Int) {
+        activeScreenStreamIndex = monitorIndex
         liveStreamJob?.cancel()
         _focusedLiveFrame.value = null
         _h264VideoConfig.value = null
@@ -633,8 +693,10 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                 }
                             } else if (parsed?.get("type")?.jsonPrimitive?.content == "error") {
                                 val message = parsed["message"]?.jsonPrimitive?.content ?: "Hardware stream failed"
-                                _h264Error.value = message
-                                _inputStatus.value = message
+                                if (!shouldSuppressScreenGoneError(message)) {
+                                    _h264Error.value = message
+                                    _inputStatus.value = message
+                                }
                             }
                         }
                     }
@@ -658,6 +720,150 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             } catch (e: Exception) {
                 Log.e("TaskbarViewModel", "Fetch screens failed", e)
                 _inputStatus.value = "Failed to fetch screen list: ${e.localizedMessage}"
+            }
+        }
+    }
+
+    fun fetchExtendedDisplayStatus() {
+        viewModelScope.launch {
+            val ip = _pcIp.value
+            if (ip.isEmpty()) return@launch
+            fetchExtendedDisplayStatusNow(ip)
+        }
+    }
+
+    private suspend fun fetchExtendedDisplayStatusNow(ip: String = _pcIp.value): ExtendedDisplayStatus? {
+        if (ip.isEmpty()) return null
+        return try {
+            val status: ExtendedDisplayStatus = client.get("http://$ip:8000/extended_display/status") {
+                header("password", _password.value)
+            }.body()
+            _extendedDisplayStatus.value = status
+            status
+        } catch (e: Exception) {
+            val status = ExtendedDisplayStatus(
+                available = false,
+                message = "Extended display status failed: ${e.localizedMessage}"
+            )
+            _extendedDisplayStatus.value = status
+            status
+        }
+    }
+
+    fun connectExtendedDisplay(onConnected: (ScreenInfo) -> Unit) {
+        if (_extendedDisplayConnecting.value) return
+        val ip = _pcIp.value
+        if (ip.isEmpty()) return
+        _extendedDisplayConnecting.value = true
+        viewModelScope.launch {
+            try {
+                val response: ExtendedDisplayConnectResponse = client.post("http://$ip:8000/extended_display/connect") {
+                    header("password", _password.value)
+                    contentType(ContentType.Application.Json)
+                    setBody(buildJsonObject {
+                        put("client_id", clientId)
+                    }.toString())
+                }.body()
+                fetchScreens()
+                fetchExtendedDisplayStatus()
+                val screen = response.screen ?: ScreenInfo(monitor_index = response.monitor_index)
+                if (screen.monitor_index > 0) {
+                    onConnected(screen)
+                } else {
+                    _inputStatus.value = response.message.ifBlank { "Extended display connected, but no monitor index was returned" }
+                }
+            } catch (e: ClientRequestException) {
+                _inputStatus.value = "Extended display unavailable: ${e.response.status}"
+                fetchExtendedDisplayStatus()
+            } catch (e: ServerResponseException) {
+                _inputStatus.value = "Extended display failed: ${e.response.status}"
+                fetchExtendedDisplayStatus()
+            } catch (e: Exception) {
+                Log.e("TaskbarViewModel", "Connect extended display failed", e)
+                _inputStatus.value = "Extended display failed: ${e.localizedMessage}"
+                fetchExtendedDisplayStatus()
+            } finally {
+                _extendedDisplayConnecting.value = false
+            }
+        }
+    }
+
+    fun disconnectExtendedDisplayBinding() {
+        val ip = _pcIp.value
+        if (ip.isEmpty()) return
+        viewModelScope.launch {
+            runCatching {
+                client.post("http://$ip:8000/extended_display/disconnect") {
+                    header("password", _password.value)
+                    contentType(ContentType.Application.Json)
+                    setBody(buildJsonObject { put("client_id", clientId) }.toString())
+                }
+            }
+            fetchExtendedDisplayStatus()
+        }
+    }
+
+    fun setExtendedDisplayDriverEnabled(enabled: Boolean) {
+        if (_extendedDisplayDriverChanging.value) return
+        val ip = _pcIp.value
+        if (ip.isEmpty()) return
+        _extendedDisplayDriverChanging.value = true
+        val previousMonitorIndex = _extendedDisplayStatus.value?.monitor_index ?: 0
+        val activeMonitorIndex = activeScreenStreamIndex ?: previousMonitorIndex
+        if (!enabled && activeMonitorIndex > 0) {
+            suppressScreenGoneErrorsUntil = SystemClock.uptimeMillis() + 6000L
+            stopLiveStream()
+            stopRemoteInput()
+            _inputStatus.value = null
+        }
+        viewModelScope.launch {
+            try {
+                val response: ExtendedDisplayStatus = client.post("http://$ip:8000/extended_display/driver_state") {
+                    header("password", _password.value)
+                    contentType(ContentType.Application.Json)
+                    timeout { requestTimeoutMillis = 25000 }
+                    setBody(buildJsonObject {
+                        put("client_id", clientId)
+                        put("enabled", enabled)
+                    }.toString())
+                }.body()
+                _extendedDisplayStatus.value = response
+                fetchScreens()
+                if (!enabled) {
+                    _inputStatus.value = null
+                    _h264Error.value = null
+                }
+            } catch (e: ClientRequestException) {
+                val status = fetchExtendedDisplayStatusNow(ip)
+                if (status?.driver_enabled == enabled || (!enabled && status?.available == false)) {
+                    _inputStatus.value = null
+                    _h264Error.value = null
+                } else {
+                    _inputStatus.value = when (e.response.status.value) {
+                        403 -> "Run the PC backend as administrator to change the virtual display driver"
+                        404 -> "No compatible virtual display driver was found"
+                        else -> "Virtual display driver change failed: ${e.response.status}"
+                    }
+                }
+            } catch (e: ServerResponseException) {
+                val status = fetchExtendedDisplayStatusNow(ip)
+                if (status?.driver_enabled == enabled || (!enabled && status?.available == false)) {
+                    _inputStatus.value = null
+                    _h264Error.value = null
+                } else {
+                    _inputStatus.value = "Virtual display driver change failed: ${e.response.status}"
+                }
+            } catch (e: Exception) {
+                Log.e("TaskbarViewModel", "Set VDD driver state failed", e)
+                val status = fetchExtendedDisplayStatusNow(ip)
+                if (status?.driver_enabled == enabled || (!enabled && status?.available == false)) {
+                    _inputStatus.value = null
+                    _h264Error.value = null
+                } else {
+                    _inputStatus.value = "Virtual display driver change failed: ${e.localizedMessage}"
+                }
+            } finally {
+                _extendedDisplayDriverChanging.value = false
             }
         }
     }

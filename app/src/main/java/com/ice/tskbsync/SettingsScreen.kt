@@ -37,6 +37,8 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val shortcuts by viewModel.shortcuts
     val windowFilter by viewModel.windowFilter
     val h264Status by viewModel.h264Status
+    val extendedDisplayStatus by viewModel.extendedDisplayStatus
+    val extendedDisplayDriverChanging by viewModel.extendedDisplayDriverChanging
     
     var tempIp by remember { mutableStateOf(pcIp) }
     var tempPass by remember { mutableStateOf(password) }
@@ -56,7 +58,10 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val titleColor = Color(theme.titleColor)
 
     LaunchedEffect(pcIp) {
-        if (pcIp.isNotEmpty()) viewModel.fetchH264Status()
+        if (pcIp.isNotEmpty()) {
+            viewModel.fetchH264Status()
+            viewModel.fetchExtendedDisplayStatus()
+        }
     }
 
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
@@ -198,6 +203,34 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         Switch(
                                             checked = theme.useHighPerformanceWindowStreaming,
                                             onCheckedChange = { viewModel.updateTheme(theme.copy(useHighPerformanceWindowStreaming = it)) }
+                                        )
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Text("Show Virtual Display Button", modifier = Modifier.weight(1f))
+                                        Switch(
+                                            checked = theme.showVirtualDisplayButton,
+                                            onCheckedChange = { viewModel.updateTheme(theme.copy(showVirtualDisplayButton = it)) }
+                                        )
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text("Enable Virtual Display Driver")
+                                            val statusText = when {
+                                                extendedDisplayStatus == null -> "Status not loaded"
+                                                extendedDisplayStatus?.requires_admin == true -> "Run PC backend as administrator"
+                                                extendedDisplayDriverChanging -> "Updating..."
+                                                extendedDisplayStatus?.driver_enabled == false && extendedDisplayStatus?.available == false -> "Disabled"
+                                                extendedDisplayStatus?.driver_control_available != true -> "No compatible VDD found"
+                                                else -> extendedDisplayStatus?.driver_status?.ifBlank { extendedDisplayStatus?.message } ?: ""
+                                            }
+                                            Text(statusText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                        Switch(
+                                            checked = extendedDisplayStatus?.driver_enabled == true,
+                                            enabled = extendedDisplayStatus?.driver_control_available == true &&
+                                                extendedDisplayStatus?.requires_admin != true &&
+                                                !extendedDisplayDriverChanging,
+                                            onCheckedChange = { viewModel.setExtendedDisplayDriverEnabled(it) }
                                         )
                                     }
                                     H264StatusPanel(

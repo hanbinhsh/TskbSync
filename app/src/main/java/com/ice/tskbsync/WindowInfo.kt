@@ -26,8 +26,46 @@ data class ScreenInfo(
     val width: Int = 0,
     val height: Int = 0,
     val is_primary: Boolean = false,
+    val is_virtual: Boolean = false,
+    val virtual_driver: String = "",
+    val extended_owner: String = "",
     val device: String = "",
     val name: String = ""
+)
+
+@Serializable
+data class ExtendedDisplayMode(
+    val width: Int = 0,
+    val height: Int = 0,
+    val fps: Int = 0
+)
+
+@Serializable
+data class ExtendedDisplayStatus(
+    val available: Boolean = false,
+    val message: String = "",
+    val driver_control_available: Boolean = false,
+    val driver_enabled: Boolean = false,
+    val requires_admin: Boolean = false,
+    val is_admin: Boolean = false,
+    val driver_instance_id: String = "",
+    val driver_status: String = "",
+    val driver_name: String = "",
+    val driver_error: String = "",
+    val bound_client_id: String = "",
+    val monitor_index: Int = 0,
+    val screen: ScreenInfo? = null,
+    val current_mode: ExtendedDisplayMode? = null,
+    val supported_modes: List<ExtendedDisplayMode> = emptyList()
+)
+
+@Serializable
+data class ExtendedDisplayConnectResponse(
+    val status: String = "",
+    val message: String = "",
+    val monitor_index: Int = 0,
+    val screen: ScreenInfo? = null,
+    val current_mode: ExtendedDisplayMode? = null
 )
 
 @Serializable
