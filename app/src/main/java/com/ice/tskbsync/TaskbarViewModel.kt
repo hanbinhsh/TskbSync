@@ -142,6 +142,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private var suppressScreenGoneErrorsUntil = 0L
 
     private var activeWsSession: DefaultClientWebSocketSession? = null
+    private var wantsGridPreviews = false
     val discoveredServers = mutableStateListOf<String>()
     private var isDiscovering = false
     private val reconnectBaseDelayMs = 1500L
@@ -180,6 +181,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                     client.webSocket("ws://$ip:8000/ws") {
                         activeWsSession = this
                         send(Frame.Text(pass))
+                        send(Frame.Text(if (wantsGridPreviews) "grid_preview:1" else "grid_preview:0"))
                         _isConnected.value = true
                         _error.value = null
                         reconnectDelay = reconnectBaseDelayMs
@@ -609,6 +611,18 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 parameter("interval_ms", settings.gridPreviewIntervalMs)
             }
         } catch (e: Exception) { }
+    }
+
+    fun setGridPreviewActive(active: Boolean) {
+        if (wantsGridPreviews == active) return
+        wantsGridPreviews = active
+        viewModelScope.launch {
+            try {
+                activeWsSession?.send(Frame.Text(if (active) "grid_preview:1" else "grid_preview:0"))
+            } catch (e: Exception) {
+                Log.d("TaskbarViewModel", "Grid preview mode update failed: ${e.localizedMessage}")
+            }
+        }
     }
 
     fun fetchH264Status(refresh: Boolean = false) {

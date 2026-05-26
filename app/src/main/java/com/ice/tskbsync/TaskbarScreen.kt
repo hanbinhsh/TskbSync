@@ -6,8 +6,8 @@ import android.media.MediaFormat
 import android.util.Base64
 import android.util.Log
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.TextureView
+import android.graphics.SurfaceTexture
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.SizeTransform
@@ -122,9 +122,15 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
         ?: windows.firstOrNull()
 
     LaunchedEffect(isLandscapeSingleMode, layoutMode, theme.showPreviews) {
-        if (!theme.showPreviews || (!isLandscapeSingleMode && layoutMode == "grid")) {
+        val gridPreviewActive = theme.showPreviews && !isLandscapeSingleMode && layoutMode == "grid"
+        viewModel.setGridPreviewActive(gridPreviewActive)
+        if (!theme.showPreviews || gridPreviewActive) {
             viewModel.stopLiveStream()
         }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { viewModel.setGridPreviewActive(false) }
     }
 
     LaunchedEffect(screens, selectedScreenIndex) {
@@ -1478,20 +1484,31 @@ fun H264PreviewContainer(
 
         AndroidView(
             factory = { context ->
-                SurfaceView(context).apply {
-                    holder.addCallback(object : SurfaceHolder.Callback {
-                        override fun surfaceCreated(holder: SurfaceHolder) {
-                            surface = holder.surface
+                TextureView(context).apply {
+                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                        private var ownedSurface: Surface? = null
+
+                        override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                            ownedSurface?.release()
+                            ownedSurface = Surface(texture)
+                            surface = ownedSurface
                         }
 
-                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                            surface = holder.surface
+                        override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
                         }
 
-                        override fun surfaceDestroyed(holder: SurfaceHolder) {
-                            surface = null
+                        override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                            if (surface == ownedSurface) {
+                                surface = null
+                            }
+                            ownedSurface?.release()
+                            ownedSurface = null
+                            return true
                         }
-                    })
+
+                        override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
+                        }
+                    }
                 }
             },
             modifier = Modifier

@@ -799,6 +799,7 @@ LIVE_TARGET_FPS = 30.0
 GRID_PREVIEW_INTERVAL = 5.0
 current_obs_hwnd = 0
 connected_clients = set()
+grid_preview_clients = set()
 active_live_streams = 0
 DEFAULT_SYSTEM_TITLE_FILTERS = [
     "Windows 输入体验",
@@ -2178,12 +2179,18 @@ async def websocket_endpoint(websocket: WebSocket):
             msg = await websocket.receive_text()
             if msg.startswith("observe:"):
                 global current_obs_hwnd; current_obs_hwnd = int(msg.split(":")[1])
+            elif msg == "grid_preview:1":
+                grid_preview_clients.add(websocket)
+            elif msg == "grid_preview:0":
+                grid_preview_clients.discard(websocket)
             elif msg == "ping": await websocket.send_text("pong")
     except WebSocketDisconnect:
         pass
     except Exception as e:
         print(f"[ws] failed: {type(e).__name__}: {e}", flush=True)
-    finally: connected_clients.discard(websocket)
+    finally:
+        connected_clients.discard(websocket)
+        grid_preview_clients.discard(websocket)
 
 
 @app.websocket("/live/{hwnd}")
@@ -3275,15 +3282,28 @@ async def grid_preview_broadcaster():
         return previews
 
     while True:
+        started_at = time.perf_counter()
         try:
-            if connected_clients and active_live_streams == 0:
+            clients = list(grid_preview_clients)
+            if clients:
                 previews = await asyncio.to_thread(fetch_grid_previews)
                 if previews:
                     msg = json.dumps({"type": "grid_previews", "data": previews})
-                    for ws in list(connected_clients): await ws.send_text(msg)
-            await asyncio.sleep(GRID_PREVIEW_INTERVAL)
+                    stale_clients = []
+                    for ws in clients:
+                        try:
+                            await ws.send_text(msg)
+                        except Exception:
+                            stale_clients.append(ws)
+                    for ws in stale_clients:
+                        grid_preview_clients.discard(ws)
+                        connected_clients.discard(ws)
+            elapsed = time.perf_counter() - started_at
+            await asyncio.sleep(max(0.05, GRID_PREVIEW_INTERVAL - elapsed))
         except asyncio.CancelledError: break # 关键修复！
-        except Exception: await asyncio.sleep(GRID_PREVIEW_INTERVAL)
+        except Exception:
+            elapsed = time.perf_counter() - started_at
+            await asyncio.sleep(max(0.05, GRID_PREVIEW_INTERVAL - elapsed))
 
 def udp_discovery():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
