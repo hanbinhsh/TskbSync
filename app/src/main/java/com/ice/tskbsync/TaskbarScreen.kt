@@ -1,5 +1,7 @@
 package com.ice.tskbsync
 
+import android.app.Activity
+import android.content.Context
 import android.graphics.BitmapFactory
 import android.media.MediaCodec
 import android.media.MediaFormat
@@ -8,6 +10,9 @@ import android.util.Log
 import android.view.Surface
 import android.view.TextureView
 import android.graphics.SurfaceTexture
+import android.view.WindowInsets
+import android.view.WindowInsetsController
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.SizeTransform
@@ -58,6 +63,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
@@ -109,17 +115,52 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
     var isLandscapeSingleMode by rememberSaveable { mutableStateOf(false) }
     var showLandscapeShortcutBar by rememberSaveable { mutableStateOf(false) }
     var showWindowControlBar by rememberSaveable { mutableStateOf(false) }
+    var isFullscreenPreview by rememberSaveable { mutableStateOf(false) }
+    var showFullscreenExitHint by rememberSaveable { mutableStateOf(false) }
     var landscapeInputMode by rememberSaveable { mutableStateOf("touch") }
     var rightPanelMode by rememberSaveable { mutableStateOf<String?>(null) } // null/window list, "mouse", "screen"
     var selectedScreenIndex by rememberSaveable { mutableStateOf<Int?>(null) }
     var keyboardText by remember { mutableStateOf(TextFieldValue("")) }
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
+    val view = LocalView.current
+    val activity = remember(view) { view.context.findActivity() }
     val coroutineScope = rememberCoroutineScope()
     val contentMode = if (isLandscapeSingleMode) "landscape" else layoutMode
     val controlledWindow = windows.firstOrNull { it.hwnd == viewModel.selectedRowHwnd.value }
         ?: windows.firstOrNull { it.is_active }
         ?: windows.firstOrNull()
+    val fullscreenPreviewUsesH264 = if (selectedScreenIndex != null) {
+        theme.useHardwareEncoding
+    } else {
+        theme.useHighPerformanceWindowStreaming
+    }
+
+    BackHandler(enabled = isFullscreenPreview) {
+        if (showFullscreenExitHint) {
+            isFullscreenPreview = false
+            showFullscreenExitHint = false
+        } else {
+            showFullscreenExitHint = true
+        }
+    }
+
+    DisposableEffect(isFullscreenPreview, activity) {
+        val window = activity?.window
+        if (isFullscreenPreview && window != null) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.let { controller ->
+                controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        }
+        onDispose {
+            if (window != null) {
+                window.insetsController?.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                window.setDecorFitsSystemWindows(true)
+            }
+        }
+    }
 
     LaunchedEffect(isLandscapeSingleMode, layoutMode, theme.showPreviews) {
         val gridPreviewActive = theme.showPreviews && !isLandscapeSingleMode && layoutMode == "grid"
@@ -146,14 +187,28 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
         Scaffold(
             containerColor = bgColor,
             topBar = {
-                CenterAlignedTopAppBar(
-                    navigationIcon = {
+                if (!isFullscreenPreview) {
+                    CenterAlignedTopAppBar(
+                        navigationIcon = {
                         if (showWindowControlBar) {
                             IconButton(onClick = { showWindowControlBar = false }) {
                                 Icon(Icons.Default.Close, null, tint = titleColor)
                             }
                         } else {
                             Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (isLandscapeSingleMode && controlledWindow != null) {
+                                    IconButton(onClick = {
+                                        isFullscreenPreview = true
+                                        showFullscreenExitHint = false
+                                        showLandscapeShortcutBar = false
+                                        showWindowControlBar = false
+                                        if (selectedScreenIndex == null) {
+                                            viewModel.startLiveStream(controlledWindow.hwnd)
+                                        }
+                                    }) {
+                                        Icon(Icons.Default.Fullscreen, null, tint = titleColor)
+                                    }
+                                }
                                 IconButton(onClick = {
                                     showWindowControlBar = true
                                     showLandscapeShortcutBar = false
@@ -175,8 +230,8 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                 }
                             }
                         }
-                    },
-                    title = {
+                        },
+                        title = {
                         if (showWindowControlBar) {
                             Row(
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -260,8 +315,8 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                 }
                             }
                         }
-                    },
-                    actions = {
+                        },
+                        actions = {
                         if (!showLandscapeShortcutBar && !showWindowControlBar) {
                             IconButton(onClick = { isLandscapeSingleMode = !isLandscapeSingleMode }) {
                                 Icon(
@@ -286,9 +341,10 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                 Icon(Icons.Default.Settings, null, tint = titleColor)
                             }
                         }
-                    },
-                    colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = topBarColor)
-                )
+                        },
+                        colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = topBarColor)
+                    )
+                }
             }
         ) { padding ->
             Box(modifier = Modifier.fillMaxSize()) {
@@ -335,7 +391,54 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                     )
                 }
 
-                if (isLandscapeSingleMode) {
+                if (isFullscreenPreview) {
+                    BoxWithConstraints(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        val isAlreadyLandscape = maxWidth > maxHeight
+                        val fullscreenContent: @Composable BoxScope.() -> Unit = {
+                            if (!isConnected) {
+                                ConnectionStatusPlaceholder(pcIp, error, titleColor) { viewModel.connect(pcIp) }
+                            } else if (controlledWindow == null) {
+                                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    Text("No window", color = titleColor.copy(alpha = 0.75f))
+                                }
+                            } else {
+                                FullscreenWindowPreview(
+                                    currentWindow = controlledWindow,
+                                    accentColor = accentColor,
+                                    containerColor = containerBgBase,
+                                    useHardwareEncoding = fullscreenPreviewUsesH264,
+                                    clipLivePreview = theme.clipLivePreview,
+                                    livePreviewCornerPx = theme.livePreviewCornerPx,
+                                    focusedLiveFrame = viewModel.focusedLiveFrame,
+                                    h264VideoConfig = viewModel.h264VideoConfig,
+                                    h264Error = viewModel.h264Error,
+                                    h264Frames = viewModel.h264Frames,
+                                    showExitHint = showFullscreenExitHint,
+                                    inputMode = landscapeInputMode,
+                                    onMouseInput = { action, x, y -> viewModel.sendMouseInput(action, x, y) },
+                                    onTouchInput = { action, x, y -> viewModel.sendTouchInput(action, x, y) },
+                                    onMultiTouchInput = { points -> viewModel.sendMultiTouchInput(points) }
+                                )
+                            }
+                        }
+                        if (isAlreadyLandscape) {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center,
+                                content = fullscreenContent
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .requiredWidth(maxHeight)
+                                    .requiredHeight(maxWidth)
+                                    .rotate(90f),
+                                contentAlignment = Alignment.Center,
+                                content = fullscreenContent
+                            )
+                        }
+                    }
+                } else if (isLandscapeSingleMode) {
                     BoxWithConstraints(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
                         val isAlreadyLandscape = maxWidth > maxHeight
                         val landscapePreviewUsesH264 = if (selectedScreenIndex != null) {
@@ -504,6 +607,170 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
         }
     }
 }
+}
+
+@Composable
+fun FullscreenWindowPreview(
+    currentWindow: WindowInfo,
+    accentColor: Color,
+    containerColor: Color,
+    useHardwareEncoding: Boolean,
+    clipLivePreview: Boolean,
+    livePreviewCornerPx: Int,
+    focusedLiveFrame: State<ByteArray?>,
+    h264VideoConfig: State<H264VideoConfig?>,
+    h264Error: State<String?>,
+    h264Frames: SharedFlow<ByteArray>,
+    showExitHint: Boolean,
+    inputMode: String,
+    onMouseInput: (String, Float, Float) -> Unit,
+    onTouchInput: (String, Float, Float) -> Unit,
+    onMultiTouchInput: (List<TouchPointInput>) -> Unit
+) {
+    val liveBitmapState = if (useHardwareEncoding) null else rememberLiveBitmapFrame(focusedLiveFrame, currentWindow.hwnd)
+    val liveFrameSize = if (useHardwareEncoding) {
+        h264VideoConfig.value?.let { it.width to it.height }
+    } else {
+        liveBitmapState?.value?.let { it.width to it.height }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .pointerInput(inputMode, currentWindow.hwnd, liveFrameSize) {
+                fun normalizedInPreview(px: Float, py: Float): Pair<Float, Float> {
+                    val frame = liveFrameSize
+                    if (frame == null || frame.first <= 0 || frame.second <= 0) {
+                        return (px / size.width).coerceIn(0f, 1f) to (py / size.height).coerceIn(0f, 1f)
+                    }
+                    val scale = min(size.width / frame.first.toFloat(), size.height / frame.second.toFloat())
+                    val drawnWidth = frame.first * scale
+                    val drawnHeight = frame.second * scale
+                    val left = (size.width - drawnWidth) / 2f
+                    val top = (size.height - drawnHeight) / 2f
+                    return ((px - left) / drawnWidth).coerceIn(0f, 1f) to
+                        ((py - top) / drawnHeight).coerceIn(0f, 1f)
+                }
+
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    val (startX, startY) = normalizedInPreview(down.position.x, down.position.y)
+                    var lastX = startX
+                    var lastY = startY
+                    var moved = false
+                    var lastTouchSentAt = 0L
+                    if (inputMode == "touch") {
+                        onMultiTouchInput(
+                            listOf(
+                                TouchPointInput(
+                                    id = (down.id.value % 10L).toInt(),
+                                    action = "down",
+                                    x = startX,
+                                    y = startY,
+                                    primary = true
+                                )
+                            )
+                        )
+                        lastTouchSentAt = android.os.SystemClock.uptimeMillis()
+                    } else {
+                        onMouseInput("move", startX, startY)
+                    }
+
+                    do {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull() ?: break
+                        val (x, y) = normalizedInPreview(change.position.x, change.position.y)
+                        if (abs(x - startX) > 0.006f || abs(y - startY) > 0.006f) moved = true
+                        if (inputMode == "touch") {
+                            val now = android.os.SystemClock.uptimeMillis()
+                            val points = event.changes.mapNotNull { pointer ->
+                                if (!pointer.pressed && !pointer.previousPressed) return@mapNotNull null
+                                val (px, py) = normalizedInPreview(pointer.position.x, pointer.position.y)
+                                val action = when {
+                                    pointer.pressed && !pointer.previousPressed -> "down"
+                                    pointer.pressed && pointer.previousPressed -> "move"
+                                    !pointer.pressed && pointer.previousPressed -> "up"
+                                    else -> "move"
+                                }
+                                TouchPointInput(
+                                    id = (pointer.id.value % 10L).toInt(),
+                                    action = action,
+                                    x = px,
+                                    y = py,
+                                    primary = pointer.id == down.id
+                                )
+                            }
+                            val hasDownOrUp = points.any { it.action != "move" }
+                            if (hasDownOrUp || now - lastTouchSentAt >= 8L) {
+                                onMultiTouchInput(points)
+                                lastTouchSentAt = now
+                            }
+                        } else {
+                            if (abs(x - lastX) > 0.002f || abs(y - lastY) > 0.002f) {
+                                onMouseInput("move", x, y)
+                            }
+                        }
+                        lastX = x
+                        lastY = y
+                        event.changes.forEach { it.consume() }
+                    } while (event.changes.any { it.pressed })
+
+                    if (inputMode == "touch") {
+                        val (endX, endY) = lastX to lastY
+                        onMultiTouchInput(
+                            listOf(
+                                TouchPointInput(
+                                    id = (down.id.value % 10L).toInt(),
+                                    action = "up",
+                                    x = endX,
+                                    y = endY,
+                                    primary = true
+                                )
+                            )
+                        )
+                    } else if (!moved) {
+                        onMouseInput("click", startX, startY)
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        LivePreviewContainer(
+            frame = focusedLiveFrame,
+            currentWindow = currentWindow,
+            accentColor = accentColor,
+            containerColor = containerColor.copy(alpha = 1f),
+            clipPreview = clipLivePreview,
+            cornerPx = livePreviewCornerPx,
+            decodedBitmap = liveBitmapState?.value,
+            useHardwareEncoding = useHardwareEncoding,
+            h264VideoConfig = h264VideoConfig,
+            h264Error = h264Error,
+            h264Frames = h264Frames
+        )
+
+        if (showExitHint) {
+            Surface(
+                color = MaterialTheme.colorScheme.inverseSurface.copy(alpha = 0.92f),
+                contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+                shape = RoundedCornerShape(18.dp),
+                tonalElevation = 6.dp,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 28.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(Icons.Default.KeyboardReturn, null, modifier = Modifier.size(18.dp))
+                    Text("Press Back again to exit fullscreen", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1225,6 +1492,12 @@ fun lerp(start: Color, end: Color, fraction: Float): Color {
         blue = start.blue + (end.blue - start.blue) * fraction,
         alpha = start.alpha + (end.alpha - start.alpha) * fraction
     )
+}
+
+tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is android.content.ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 @Composable

@@ -16,6 +16,7 @@ import subprocess
 import shutil
 import os
 import uuid
+import struct
 from pathlib import Path
 from ctypes import wintypes
 from contextlib import asynccontextmanager
@@ -3255,6 +3256,519 @@ async def live_h264_screen_stream_endpoint(
             pass
     finally:
         active_live_streams = max(0, active_live_streams - 1)
+        await safe_close(websocket)
+
+async def drain_process_stderr(proc, label: str):
+    try:
+        while True:
+            line = await asyncio.to_thread(proc.stderr.readline)
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if text:
+                print(f"[{label}] {text}", flush=True)
+    except Exception:
+        pass
+
+def build_wasapi_audio_cmd(ffmpeg_path: str, sample_rate: int, channels: int, frame_ms: int, use_loopback: bool):
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-fflags", "nobuffer",
+        "-flags", "low_delay",
+        "-probesize", "32",
+        "-analyzeduration", "0",
+        "-f", "wasapi",
+    ]
+    if use_loopback:
+        cmd += ["-loopback", "1"]
+    cmd += [
+        "-i", "default",
+        "-vn",
+        "-ac", str(channels),
+        "-ar", str(sample_rate),
+        "-acodec", "pcm_s16le",
+        "-f", "s16le",
+        "-blocksize", str(max(256, int(sample_rate * channels * 2 * frame_ms / 1000))),
+        "pipe:1",
+    ]
+    return cmd
+
+async def start_wasapi_audio_process(sample_rate: int, channels: int, frame_ms: int):
+    ffmpeg_path = get_ffmpeg_exe()
+    if not ffmpeg_path:
+        return None, "FFmpeg not found. Configure PATH, TSKBSYNC_FFMPEG, TSKBSYNC_FFMPEG_DIR, or pc_backend\\ffmpeg_path.txt."
+
+    attempts = [
+        ("wasapi-loopback", build_wasapi_audio_cmd(ffmpeg_path, sample_rate, channels, frame_ms, True)),
+        ("wasapi-default", build_wasapi_audio_cmd(ffmpeg_path, sample_rate, channels, frame_ms, False)),
+    ]
+    last_error = ""
+    for label, cmd in attempts:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                bufsize=0,
+            )
+            await asyncio.sleep(0.25)
+            if proc.poll() is None:
+                print(f"[audio] started {label}: sample_rate={sample_rate} channels={channels} frame_ms={frame_ms}", flush=True)
+                return proc, ""
+            stderr = ""
+            try:
+                stderr = (proc.stderr.read() or b"").decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            last_error = stderr.strip() or f"{label} exited with code {proc.returncode}"
+            print(f"[audio] {label} failed: {last_error}", flush=True)
+        except Exception as e:
+            last_error = f"{label}: {type(e).__name__}: {e}"
+            print(f"[audio] {last_error}", flush=True)
+    return None, f"WASAPI loopback unavailable: {last_error}"
+
+class PyAudioLoopbackSource:
+    def __init__(self, pa, stream, sample_rate: int, channels: int, frame_samples: int, device_name: str):
+        self.pa = pa
+        self.stream = stream
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.frame_samples = frame_samples
+        self.frame_bytes = frame_samples * channels * 2
+        self.device_name = device_name
+
+    def read(self):
+        return self.stream.read(self.frame_samples, exception_on_overflow=False)
+
+    def close(self):
+        try:
+            self.stream.stop_stream()
+        except Exception:
+            pass
+        try:
+            self.stream.close()
+        except Exception:
+            pass
+        try:
+            self.pa.terminate()
+        except Exception:
+            pass
+
+def score_pyaudio_capture_device(device, host_api_name: str):
+    name = str(device.get("name", "")).lower()
+    if int(device.get("maxInputChannels", 0) or 0) <= 0:
+        return -1
+    bad_tokens = [
+        "microphone", "mic", "麦克风", "input", "capture",
+        "noise-cancelling input", "streaming microphone",
+    ]
+    good_tokens = [
+        "loopback", "stereo mix", "what u hear", "speaker", "speakers",
+        "扬声器", "电脑扬声器", "output", "line out", "system virtual line",
+    ]
+    score = 0
+    if "wasapi" in host_api_name.lower():
+        score += 20
+    if "wdm-ks" in host_api_name.lower():
+        score += 16
+    if "directsound" in host_api_name.lower():
+        score += 6
+    for token in good_tokens:
+        if token in name:
+            score += 30
+    for token in bad_tokens:
+        if token in name:
+            score -= 40
+    return score
+
+def start_pyaudio_loopback_source(sample_rate: int, channels: int, frame_ms: int):
+    try:
+        import pyaudio
+    except Exception as e:
+        return None, f"PyAudio is not available: {type(e).__name__}: {e}"
+
+    pa = None
+    try:
+        pa = pyaudio.PyAudio()
+        candidates = []
+        for index in range(pa.get_device_count()):
+            device = pa.get_device_info_by_index(index)
+            host_api = pa.get_host_api_info_by_index(int(device.get("hostApi", 0)))
+            score = score_pyaudio_capture_device(device, host_api.get("name", ""))
+            if score >= 20:
+                candidates.append((score, device, host_api))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        errors = []
+        for score, device, host_api in candidates:
+            device_index = int(device["index"])
+            max_channels = int(device.get("maxInputChannels", 0) or 0)
+            use_channels = max(1, min(channels, max_channels, 2))
+            rate_candidates = []
+            requested = int(sample_rate)
+            default_rate = int(float(device.get("defaultSampleRate", requested) or requested))
+            for rate in (requested, default_rate, 48000, 44100):
+                if rate not in rate_candidates and 16000 <= rate <= 48000:
+                    rate_candidates.append(rate)
+            for rate in rate_candidates:
+                try:
+                    frame_samples = max(128, int(rate * frame_ms / 1000))
+                    stream = pa.open(
+                        format=pyaudio.paInt16,
+                        channels=use_channels,
+                        rate=rate,
+                        input=True,
+                        input_device_index=device_index,
+                        frames_per_buffer=frame_samples,
+                    )
+                    print(
+                        f"[audio] started pyaudio device={device_index} name={device.get('name', '')!r} "
+                        f"host={host_api.get('name', '')!r} rate={rate} channels={use_channels}",
+                        flush=True,
+                    )
+                    return PyAudioLoopbackSource(pa, stream, rate, use_channels, frame_samples, str(device.get("name", ""))), ""
+                except Exception as e:
+                    errors.append(f"{device_index}:{device.get('name', '')}@{rate}Hz {type(e).__name__}: {e}")
+        pa.terminate()
+        return None, "No usable PyAudio loopback-style input device found. Tried: " + "; ".join(errors[:6])
+    except Exception as e:
+        if pa:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+        return None, f"PyAudio loopback failed: {type(e).__name__}: {e}"
+
+class WasapiLoopbackSource:
+    def __init__(self, audio_client, capture_client, sample_rate: int, in_channels: int, out_channels: int, bits_per_sample: int, block_align: int, is_float: bool, frame_samples: int):
+        self.audio_client = audio_client
+        self.capture_client = capture_client
+        self.sample_rate = sample_rate
+        self.in_channels = in_channels
+        self.channels = out_channels
+        self.bits_per_sample = bits_per_sample
+        self.block_align = block_align
+        self.is_float = is_float
+        self.frame_samples = frame_samples
+        self.frame_bytes = frame_samples * out_channels * 2
+
+    def start(self):
+        self.audio_client.Start()
+
+    def read(self):
+        import numpy as _np
+        out = bytearray()
+        deadline = time.perf_counter() + max(0.02, self.frame_samples / max(self.sample_rate, 1) * 2.0)
+        while len(out) < self.frame_bytes:
+            packet_frames = self.capture_client.GetNextPacketSize()
+            if int(packet_frames) == 0:
+                if time.perf_counter() >= deadline:
+                    out.extend(b"\x00" * (self.frame_bytes - len(out)))
+                    break
+                time.sleep(0.001)
+                continue
+            data_ptr, frames, flags, _device_pos, _qpc_pos = self.capture_client.GetBuffer()
+            frames = int(frames)
+            flags = int(flags)
+            try:
+                raw_size = frames * int(self.block_align)
+                if flags & 0x2:  # AUDCLNT_BUFFERFLAGS_SILENT
+                    raw = b"\x00" * raw_size
+                else:
+                    raw = ctypes.string_at(data_ptr, raw_size)
+                out.extend(self._convert_to_s16(raw, frames, _np))
+            finally:
+                self.capture_client.ReleaseBuffer(frames)
+        return bytes(out[:self.frame_bytes])
+
+    def _convert_to_s16(self, raw: bytes, frames: int, np_mod):
+        if frames <= 0:
+            return b""
+        if self.bits_per_sample == 32 and self.is_float:
+            arr = np_mod.frombuffer(raw, dtype="<f4").reshape(-1, self.in_channels)
+            arr = np_mod.clip(arr[:, :self.channels], -1.0, 1.0)
+            if self.channels == 2 and arr.shape[1] == 1:
+                arr = np_mod.repeat(arr, 2, axis=1)
+            return (arr * 32767.0).astype("<i2").tobytes()
+        if self.bits_per_sample == 16:
+            arr = np_mod.frombuffer(raw, dtype="<i2").reshape(-1, self.in_channels)
+            arr = arr[:, :self.channels]
+            if self.channels == 2 and arr.shape[1] == 1:
+                arr = np_mod.repeat(arr, 2, axis=1)
+            return arr.astype("<i2", copy=False).tobytes()
+        if self.bits_per_sample == 24:
+            data = np_mod.frombuffer(raw, dtype=np_mod.uint8).reshape(-1, self.block_align)
+            samples = data[:, :self.in_channels * 3].reshape(-1, self.in_channels, 3)
+            vals = (
+                samples[:, :, 0].astype(np_mod.int32) |
+                (samples[:, :, 1].astype(np_mod.int32) << 8) |
+                (samples[:, :, 2].astype(np_mod.int32) << 16)
+            )
+            vals = np_mod.where(vals & 0x800000, vals | ~0xFFFFFF, vals)
+            vals = (vals[:, :self.channels] >> 8).astype("<i2")
+            if self.channels == 2 and vals.shape[1] == 1:
+                vals = np_mod.repeat(vals, 2, axis=1)
+            return vals.tobytes()
+        return b"\x00" * (frames * self.channels * 2)
+
+    def close(self):
+        try:
+            self.audio_client.Stop()
+        except Exception:
+            pass
+
+def start_coreaudio_wasapi_loopback_source(sample_rate: int, channels: int, frame_ms: int):
+    try:
+        import comtypes
+        from comtypes import GUID, COMMETHOD, HRESULT, POINTER
+        from comtypes.automation import IUnknown
+    except Exception as e:
+        return None, f"comtypes is not available: {type(e).__name__}: {e}"
+
+    WAVE_FORMAT_PCM = 0x0001
+    WAVE_FORMAT_IEEE_FLOAT = 0x0003
+    WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+    AUDCLNT_SHAREMODE_SHARED = 0
+    AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
+    CLSCTX_ALL = 23
+    eRender = 0
+    eConsole = 0
+    IID_IAudioCaptureClient = GUID("{C8ADBD64-E71E-48A0-A4DE-185C395CD317}")
+    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = GUID("{00000003-0000-0010-8000-00AA00389B71}")
+
+    class WAVEFORMATEX(ctypes.Structure):
+        _fields_ = [
+            ("wFormatTag", wintypes.WORD),
+            ("nChannels", wintypes.WORD),
+            ("nSamplesPerSec", wintypes.DWORD),
+            ("nAvgBytesPerSec", wintypes.DWORD),
+            ("nBlockAlign", wintypes.WORD),
+            ("wBitsPerSample", wintypes.WORD),
+            ("cbSize", wintypes.WORD),
+        ]
+
+    class WAVEFORMATEXTENSIBLE(ctypes.Structure):
+        _fields_ = [
+            ("Format", WAVEFORMATEX),
+            ("wValidBitsPerSample", wintypes.WORD),
+            ("dwChannelMask", wintypes.DWORD),
+            ("SubFormat", GUID),
+        ]
+
+    class IMMDevice(IUnknown):
+        _iid_ = GUID("{D666063F-1587-4E43-81F1-B948E807363F}")
+        _methods_ = [
+            COMMETHOD([], HRESULT, "Activate",
+                (["in"], POINTER(GUID), "iid"),
+                (["in"], wintypes.DWORD, "dwClsCtx"),
+                (["in"], ctypes.c_void_p, "pActivationParams"),
+                (["out"], ctypes.POINTER(ctypes.c_void_p), "ppInterface")),
+        ]
+
+    class IMMDeviceEnumerator(IUnknown):
+        _iid_ = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+        _methods_ = [
+            COMMETHOD([], HRESULT, "EnumAudioEndpoints"),
+            COMMETHOD([], HRESULT, "GetDefaultAudioEndpoint",
+                (["in"], ctypes.c_int, "dataFlow"),
+                (["in"], ctypes.c_int, "role"),
+                (["out"], ctypes.POINTER(POINTER(IMMDevice)), "ppEndpoint")),
+        ]
+
+    class IAudioClient(IUnknown):
+        _iid_ = GUID("{1CB9AD4C-DBFA-4c32-B178-C2F568A703B2}")
+        _methods_ = [
+            COMMETHOD([], HRESULT, "Initialize",
+                (["in"], ctypes.c_int, "ShareMode"),
+                (["in"], wintypes.DWORD, "StreamFlags"),
+                (["in"], ctypes.c_longlong, "hnsBufferDuration"),
+                (["in"], ctypes.c_longlong, "hnsPeriodicity"),
+                (["in"], ctypes.POINTER(WAVEFORMATEX), "pFormat"),
+                (["in"], ctypes.POINTER(GUID), "AudioSessionGuid")),
+            COMMETHOD([], HRESULT, "GetBufferSize", (["out"], ctypes.POINTER(ctypes.c_uint32), "pNumBufferFrames")),
+            COMMETHOD([], HRESULT, "GetStreamLatency"),
+            COMMETHOD([], HRESULT, "GetCurrentPadding"),
+            COMMETHOD([], HRESULT, "IsFormatSupported"),
+            COMMETHOD([], HRESULT, "GetMixFormat", (["out"], ctypes.POINTER(ctypes.POINTER(WAVEFORMATEX)), "ppDeviceFormat")),
+            COMMETHOD([], HRESULT, "GetDevicePeriod"),
+            COMMETHOD([], HRESULT, "Start"),
+            COMMETHOD([], HRESULT, "Stop"),
+            COMMETHOD([], HRESULT, "Reset"),
+            COMMETHOD([], HRESULT, "SetEventHandle"),
+            COMMETHOD([], HRESULT, "GetService",
+                (["in"], POINTER(GUID), "riid"),
+                (["out"], ctypes.POINTER(ctypes.c_void_p), "ppv")),
+        ]
+
+    class IAudioCaptureClient(IUnknown):
+        _iid_ = IID_IAudioCaptureClient
+        _methods_ = [
+            COMMETHOD([], HRESULT, "GetBuffer",
+                (["out"], ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)), "ppData"),
+                (["out"], ctypes.POINTER(ctypes.c_uint32), "pNumFramesToRead"),
+                (["out"], ctypes.POINTER(wintypes.DWORD), "pdwFlags"),
+                (["out"], ctypes.POINTER(ctypes.c_uint64), "pu64DevicePosition"),
+                (["out"], ctypes.POINTER(ctypes.c_uint64), "pu64QPCPosition")),
+            COMMETHOD([], HRESULT, "ReleaseBuffer", (["in"], ctypes.c_uint32, "NumFramesRead")),
+            COMMETHOD([], HRESULT, "GetNextPacketSize", (["out"], ctypes.POINTER(ctypes.c_uint32), "pNumFramesInNextPacket")),
+        ]
+
+    try:
+        comtypes.CoInitialize()
+        enumerator = comtypes.CoCreateInstance(
+            GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}"),
+            interface=IMMDeviceEnumerator,
+            clsctx=CLSCTX_ALL,
+        )
+        device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)
+        audio_client_ptr = device.Activate(ctypes.byref(IAudioClient._iid_), CLSCTX_ALL, None)
+        audio_client = ctypes.cast(audio_client_ptr, POINTER(IAudioClient))
+        mix_ptr = audio_client.GetMixFormat()
+        fmt = mix_ptr.contents
+        ext = ctypes.cast(mix_ptr, ctypes.POINTER(WAVEFORMATEXTENSIBLE)).contents if fmt.wFormatTag == WAVE_FORMAT_EXTENSIBLE else None
+        raw_bits = int(ext.wValidBitsPerSample if ext else fmt.wBitsPerSample)
+        bits = raw_bits if raw_bits in (8, 16, 24, 32) else int(fmt.wBitsPerSample)
+        subtype = str(ext.SubFormat).lower() if ext is not None else ""
+        is_float = fmt.wFormatTag == WAVE_FORMAT_IEEE_FLOAT or "00000003" in subtype or bits == 32
+        actual_rate = int(fmt.nSamplesPerSec)
+        input_channels = int(fmt.nChannels)
+        output_channels = max(1, min(int(channels), input_channels, 2))
+        frame_samples = max(128, int(actual_rate * frame_ms / 1000))
+        buffer_duration_ms = max(40, int(frame_ms) * 4)
+        audio_client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+            buffer_duration_ms * 10_000,
+            0,
+            mix_ptr,
+            None,
+        )
+        capture_ptr = audio_client.GetService(ctypes.byref(IID_IAudioCaptureClient))
+        capture_client = ctypes.cast(capture_ptr, POINTER(IAudioCaptureClient))
+        source = WasapiLoopbackSource(
+            audio_client,
+            capture_client,
+            actual_rate,
+            input_channels,
+            output_channels,
+            bits,
+            int(fmt.nBlockAlign),
+            is_float,
+            frame_samples,
+        )
+        source.start()
+        print(
+            f"[audio] started coreaudio-wasapi-loopback rate={actual_rate} in_ch={input_channels} "
+            f"out_ch={output_channels} bits={bits} float={is_float} buffer_ms={buffer_duration_ms}",
+            flush=True,
+        )
+        return source, ""
+    except Exception as e:
+        return None, f"Core Audio WASAPI loopback failed: {type(e).__name__}: {e}"
+
+@app.websocket("/audio/loopback")
+async def audio_loopback_endpoint(
+    websocket: WebSocket,
+    sample_rate: int = 48000,
+    channels: int = 2,
+    frame_ms: int = 20,
+):
+    await websocket.accept()
+    proc = None
+    audio_source = None
+    stderr_task = None
+    try:
+        if await websocket.receive_text() != PASSWORD:
+            await websocket.send_text("error: auth failed")
+            await safe_close(websocket)
+            return
+
+        sample_rate = max(16000, min(int(sample_rate), 48000))
+        channels = max(1, min(int(channels), 2))
+        frame_ms = max(10, min(int(frame_ms), 40))
+        frame_bytes = int(sample_rate * channels * 2 * frame_ms / 1000)
+        if frame_bytes <= 0:
+            await websocket.send_text(json.dumps({"type": "error", "message": "invalid audio frame size"}))
+            return
+
+        audio_source, coreaudio_error = await asyncio.to_thread(start_coreaudio_wasapi_loopback_source, sample_rate, channels, frame_ms)
+        source_name = "coreaudio-wasapi-loopback"
+        if audio_source:
+            sample_rate = audio_source.sample_rate
+            channels = audio_source.channels
+            frame_bytes = audio_source.frame_bytes
+        else:
+            print(f"[audio] coreaudio fallback unavailable: {coreaudio_error}", flush=True)
+            audio_source, pyaudio_error = await asyncio.to_thread(start_pyaudio_loopback_source, sample_rate, channels, frame_ms)
+            source_name = "pyaudio"
+        if audio_source:
+            sample_rate = audio_source.sample_rate
+            channels = audio_source.channels
+            frame_bytes = audio_source.frame_bytes
+        else:
+            print(f"[audio] pyaudio fallback unavailable: {pyaudio_error}", flush=True)
+            proc, error = await start_wasapi_audio_process(sample_rate, channels, frame_ms)
+            if not proc:
+                await websocket.send_text(json.dumps({"type": "error", "message": f"{coreaudio_error}; {pyaudio_error}; {error}"}))
+                return
+            source_name = "ffmpeg"
+            stderr_task = asyncio.create_task(drain_process_stderr(proc, "audio-ffmpeg"))
+
+        await websocket.send_text(json.dumps({
+            "type": "audio_config",
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "format": "pcm_s16le",
+            "frame_ms": frame_ms,
+            "source": source_name,
+        }))
+
+        seq = 0
+        start_us = int(time.perf_counter() * 1_000_000)
+        while not shutdown_event.is_set():
+            if audio_source:
+                chunk = await asyncio.to_thread(audio_source.read)
+            else:
+                chunk = await asyncio.to_thread(proc.stdout.read, frame_bytes)
+            if not chunk:
+                if proc and proc.poll() is not None:
+                    await websocket.send_text(json.dumps({"type": "error", "message": f"audio capture ended with code {proc.returncode}"}))
+                    break
+                await asyncio.sleep(0.005)
+                continue
+            if len(chunk) < frame_bytes:
+                chunk += b"\x00" * (frame_bytes - len(chunk))
+            pts_us = start_us + int(seq * frame_ms * 1000)
+            header = struct.pack("<QII", pts_us, seq & 0xFFFFFFFF, len(chunk))
+            await websocket.send_bytes(header + chunk)
+            seq += 1
+    except WebSocketDisconnect:
+        pass
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[audio] loopback failed: {type(e).__name__}: {e}", flush=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        except Exception:
+            pass
+    finally:
+        if stderr_task:
+            stderr_task.cancel()
+        if audio_source:
+            await asyncio.to_thread(audio_source.close)
+        if proc:
+            try:
+                proc.terminate()
+                try:
+                    await asyncio.to_thread(proc.wait, 1.5)
+                except Exception:
+                    proc.kill()
+            except Exception:
+                pass
         await safe_close(websocket)
 
 # ---------------- 捕获 CancelledError 异常，防止红字报错 ----------------

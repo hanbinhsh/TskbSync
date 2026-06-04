@@ -1,6 +1,9 @@
 package com.ice.tskbsync
 
 import android.app.Application
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.net.Uri
 import android.os.SystemClock
 import android.provider.Settings
@@ -24,8 +27,11 @@ import io.ktor.websocket.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -35,6 +41,8 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.UUID
 import kotlin.math.roundToLong
 
@@ -48,6 +56,12 @@ data class TouchPointInput(
     val primary: Boolean = false
 )
 
+private data class AudioPacket(
+    val ptsUs: Long,
+    val seq: Long,
+    val payload: ByteArray
+)
+
 class TaskbarViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsManager = SettingsManager(application)
     private val clientId: String =
@@ -56,6 +70,11 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private var connectionJob: Job? = null
     private var liveStreamJob: Job? = null
     private var inputJob: Job? = null
+    private var audioJob: Job? = null
+    private var audioSessionKey: String? = null
+    private val audioTrackLock = Any()
+    private var activeAudioTrack: AudioTrack? = null
+    private var audioGeneration = 0
 
     private val client = HttpClient {
         install(ContentNegotiation) {
@@ -83,7 +102,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _password = mutableStateOf("")
     val password: State<String> = _password
 
-    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, true, 2000, false, 18))
+    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, false, 0, 60, true, 2000, false, 18))
     val theme: State<ThemeSettings> = _theme
 
     private val _layoutMode = mutableStateOf("grid")
@@ -107,6 +126,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     val h264Error: State<String?> = _h264Error
     private val _h264Status = mutableStateOf<H264StatusInfo?>(null)
     val h264Status: State<H264StatusInfo?> = _h264Status
+    private val _audioStatus = mutableStateOf<String?>(null)
+    val audioStatus: State<String?> = _audioStatus
     private val _h264Frames = MutableSharedFlow<ByteArray>(extraBufferCapacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     val h264Frames: SharedFlow<ByteArray> = _h264Frames
 
@@ -159,7 +180,16 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         }
-        viewModelScope.launch { settingsManager.themeSettings.collectLatest { _theme.value = it } }
+        viewModelScope.launch {
+            settingsManager.themeSettings.collectLatest { settings ->
+                _theme.value = settings
+                if (settings.enableAudio && _isConnected.value) {
+                    startAudioStreamIfEnabled(settings)
+                } else if (!settings.enableAudio) {
+                    stopAudioStream()
+                }
+            }
+        }
         viewModelScope.launch { settingsManager.layoutMode.collectLatest { _layoutMode.value = it } }
         viewModelScope.launch { settingsManager.gridColumns.collectLatest { _gridColumns.value = it } }
         viewModelScope.launch { settingsManager.showTitles.collectLatest { _showTitles.value = it } }
@@ -169,6 +199,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
 
     fun connect(ip: String) {
         connectionJob?.cancel()
+        stopAudioStream()
         _error.value = null
         val pass = _password.value
         connectionJob = viewModelScope.launch {
@@ -185,6 +216,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                         _isConnected.value = true
                         _error.value = null
                         reconnectDelay = reconnectBaseDelayMs
+                        startAudioStreamIfEnabled()
 
                         for (frame in incoming) {
                             if (frame is Frame.Text) {
@@ -221,6 +253,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                     _isConnected.value = false
                     _windows.value = emptyList()
                     activeWsSession = null
+                    stopAudioStream()
                 }
 
                 if (!isActive) break
@@ -240,6 +273,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         val ip = _pcIp.value
         if (ip.isEmpty() || hwnd == 0L) return
 
+        startAudioStreamIfEnabled()
         liveStreamJob = viewModelScope.launch {
             try {
                 val streamSettings = _theme.value
@@ -311,6 +345,257 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         _focusedLiveFrame.value = null
         _h264VideoConfig.value = null
         _h264Error.value = null
+    }
+
+    private fun startAudioStreamIfEnabled(settings: ThemeSettings = _theme.value) {
+        if (!settings.enableAudio) return
+        val ip = _pcIp.value
+        val pass = _password.value
+        if (ip.isEmpty()) return
+        val sessionKey = "$ip|$pass|${settings.audioDelayMs}|${settings.audioBufferMs}"
+        if (audioJob?.isActive == true && audioSessionKey == sessionKey) return
+
+        audioJob?.cancel()
+        releaseActiveAudioTrack()
+        val generation = ++audioGeneration
+        audioSessionKey = sessionKey
+        _audioStatus.value = null
+
+        audioJob = viewModelScope.launch {
+            val audioUrl = "ws://$ip:8000/audio/loopback?sample_rate=48000&channels=2&frame_ms=10"
+            try {
+                client.webSocket(audioUrl) {
+                    send(Frame.Text(pass))
+                    var packets: Channel<AudioPacket>? = null
+                    var playerJob: Job? = null
+                    try {
+                        for (frame in incoming) {
+                            when (frame) {
+                                is Frame.Text -> {
+                                    val text = frame.readText()
+                                    val parsed = runCatching { Json.parseToJsonElement(text).jsonObject }.getOrNull()
+                                    if (parsed?.get("type")?.jsonPrimitive?.content == "audio_config") {
+                                        val sampleRate = parsed["sample_rate"]?.jsonPrimitive?.intOrNull ?: 48000
+                                        val channels = parsed["channels"]?.jsonPrimitive?.intOrNull ?: 2
+                                        val source = parsed["source"]?.jsonPrimitive?.content ?: "audio"
+                                        packets?.close()
+                                        playerJob?.cancel()
+                                        val newPackets = Channel<AudioPacket>(capacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+                                        packets = newPackets
+                                        playerJob = launch(Dispatchers.IO) {
+                                            playAudioPackets(
+                                                packets = newPackets,
+                                                sampleRate = sampleRate,
+                                                channels = channels,
+                                                targetBufferMs = settings.audioBufferMs.coerceIn(20, 240),
+                                                delayMs = settings.audioDelayMs.coerceIn(-300, 500),
+                                                generation = generation
+                                            )
+                                        }
+                                        _audioStatus.value = "Audio connected: ${sampleRate}Hz ${channels}ch via $source"
+                                    } else if (parsed?.get("type")?.jsonPrimitive?.content == "error") {
+                                        val message = parsed["message"]?.jsonPrimitive?.content ?: "Audio stream failed"
+                                        _audioStatus.value = message
+                                        _inputStatus.value = message
+                                    }
+                                }
+                                is Frame.Binary -> {
+                                    val channel = packets
+                                    if (channel != null && generation == audioGeneration) {
+                                        parseAudioPacket(frame.readBytes())?.let { channel.trySend(it) }
+                                    }
+                                }
+                                else -> Unit
+                            }
+                        }
+                    } finally {
+                        packets?.close()
+                        playerJob?.cancel()
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val message = "Audio failed: ${e.message ?: e::class.java.simpleName}"
+                Log.e("TaskbarAudio", message, e)
+                _audioStatus.value = message
+                _inputStatus.value = message
+            } finally {
+                if (audioSessionKey == sessionKey) {
+                    audioJob = null
+                    audioSessionKey = null
+                }
+            }
+        }
+    }
+
+    private fun stopAudioStream() {
+        audioJob?.cancel()
+        audioJob = null
+        audioGeneration++
+        releaseActiveAudioTrack()
+        audioSessionKey = null
+        _audioStatus.value = null
+    }
+
+    private fun registerActiveAudioTrack(track: AudioTrack) {
+        val oldTrack = synchronized(audioTrackLock) {
+            val old = activeAudioTrack
+            activeAudioTrack = track
+            old
+        }
+        if (oldTrack !== track) releaseAudioTrack(oldTrack)
+    }
+
+    private fun releaseActiveAudioTrack() {
+        val track = synchronized(audioTrackLock) {
+            val current = activeAudioTrack
+            activeAudioTrack = null
+            current
+        }
+        releaseAudioTrack(track)
+    }
+
+    private fun releaseAudioTrackIfActive(track: AudioTrack) {
+        val shouldRelease = synchronized(audioTrackLock) {
+            if (activeAudioTrack === track) {
+                activeAudioTrack = null
+                true
+            } else {
+                false
+            }
+        }
+        if (shouldRelease) releaseAudioTrack(track)
+    }
+
+    private fun releaseAudioTrack(track: AudioTrack?) {
+        if (track == null) return
+        try {
+            track.pause()
+            track.flush()
+        } catch (e: Exception) {
+        }
+        try {
+            track.release()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun parseAudioPacket(bytes: ByteArray): AudioPacket? {
+        if (bytes.size < 16) return null
+        val header = ByteBuffer.wrap(bytes, 0, 16).order(ByteOrder.LITTLE_ENDIAN)
+        val ptsUs = header.long
+        val seq = header.int.toLong() and 0xFFFFFFFFL
+        val payloadSize = header.int
+        if (payloadSize <= 0 || bytes.size < 16 + payloadSize) return null
+        return AudioPacket(ptsUs, seq, bytes.copyOfRange(16, 16 + payloadSize))
+    }
+
+    private suspend fun playAudioPackets(
+        packets: Channel<AudioPacket>,
+        sampleRate: Int,
+        channels: Int,
+        targetBufferMs: Int,
+        delayMs: Int,
+        generation: Int
+    ) {
+        val channelConfig = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+        val bytesPerMs = (sampleRate * channels * 2 / 1000).coerceAtLeast(1)
+        val bytesPerFrame = (channels * 2).coerceAtLeast(2)
+        val minBuffer = AudioTrack.getMinBufferSize(sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT)
+        val startupBufferMs = targetBufferMs.coerceIn(20, 80)
+        val maxBufferedMs = (startupBufferMs + 80).coerceAtMost(180)
+        val trackBuffer = maxOf(minBuffer, bytesPerMs * (startupBufferMs + kotlin.math.abs(delayMs) + 80))
+        val audioFormat = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setSampleRate(sampleRate)
+            .setChannelMask(channelConfig)
+            .build()
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(audioAttributes)
+            .setAudioFormat(audioFormat)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .setBufferSizeInBytes(trackBuffer)
+            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+            .build()
+        runCatching { track.setBufferSizeInFrames((trackBuffer / bytesPerFrame).coerceAtLeast(1)) }
+        runCatching { track.setStartThresholdInFrames(((bytesPerMs * startupBufferMs) / bytesPerFrame).coerceAtLeast(1)) }
+        val queue = ArrayDeque<AudioPacket>()
+        val silence10Ms = ByteArray(bytesPerMs * 10)
+
+        fun bufferedMs(): Int = queue.sumOf { it.payload.size } / bytesPerMs
+
+        suspend fun receiveNext(timeoutMs: Long): AudioPacket? {
+            return withTimeoutOrNull(timeoutMs) {
+                packets.receiveCatching().getOrNull()
+            }
+        }
+
+        fun dropDuration(ms: Int) {
+            var remaining = ms * bytesPerMs
+            while (remaining > 0 && queue.isNotEmpty()) {
+                val first = queue.removeFirst()
+                remaining -= first.payload.size
+            }
+        }
+
+        suspend fun writePcm(bytes: ByteArray, length: Int = bytes.size): Boolean {
+            var offset = 0
+            val safeLength = length.coerceAtMost(bytes.size)
+            while (
+                offset < safeLength &&
+                currentCoroutineContext().isActive &&
+                generation == audioGeneration
+            ) {
+                val written = track.write(bytes, offset, safeLength - offset, AudioTrack.WRITE_BLOCKING)
+                if (written > 0) {
+                    offset += written
+                } else {
+                    return false
+                }
+            }
+            return offset >= safeLength
+        }
+
+        try {
+            registerActiveAudioTrack(track)
+            track.play()
+            while (bufferedMs() < startupBufferMs) {
+                if (generation != audioGeneration) return
+                val next = receiveNext(120) ?: break
+                queue.addLast(next)
+            }
+            if (delayMs > 0) {
+                var remaining = delayMs
+                while (remaining > 0) {
+                    val writeMs = remaining.coerceAtMost(10)
+                    if (!writePcm(silence10Ms, bytesPerMs * writeMs)) return
+                    remaining -= writeMs
+                }
+            } else if (delayMs < 0) {
+                dropDuration(-delayMs)
+            }
+
+            while (currentCoroutineContext().isActive && generation == audioGeneration) {
+                val next = receiveNext(if (queue.isEmpty()) 30 else 1)
+                if (next != null) queue.addLast(next)
+                while (bufferedMs() > maxBufferedMs && queue.isNotEmpty()) {
+                    queue.removeFirst()
+                }
+                val packet = if (queue.isNotEmpty()) queue.removeFirst() else null
+                if (packet != null) {
+                    if (!writePcm(packet.payload)) break
+                } else {
+                    if (!writePcm(silence10Ms)) break
+                }
+            }
+        } finally {
+            releaseAudioTrackIfActive(track)
+        }
     }
 
     fun startRemoteInput(hwnd: Long) {
@@ -587,6 +872,17 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         if (newTheme.useHardwareEncoding != oldTheme.useHardwareEncoding && newTheme.useHardwareEncoding) {
             fetchH264Status(refresh = true)
         }
+        if (
+            newTheme.enableAudio != oldTheme.enableAudio ||
+            newTheme.audioDelayMs != oldTheme.audioDelayMs ||
+            newTheme.audioBufferMs != oldTheme.audioBufferMs
+        ) {
+            if (newTheme.enableAudio && _isConnected.value) {
+                startAudioStreamIfEnabled(newTheme)
+            } else if (!newTheme.enableAudio) {
+                stopAudioStream()
+            }
+        }
         viewModelScope.launch { settingsManager.saveTheme(newTheme) }
     }
 
@@ -667,6 +963,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         _h264Error.value = null
         val ip = _pcIp.value
         if (ip.isEmpty() || monitorIndex <= 0) return
+        startAudioStreamIfEnabled()
         liveStreamJob = viewModelScope.launch {
             try {
                 val streamSettings = _theme.value

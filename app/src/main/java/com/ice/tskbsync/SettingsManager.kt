@@ -43,6 +43,9 @@ data class ThemeSettings(
     val streamFps: Int,
     val useHardwareEncoding: Boolean,
     val useHighPerformanceWindowStreaming: Boolean,
+    val enableAudio: Boolean,
+    val audioDelayMs: Int,
+    val audioBufferMs: Int,
     val showVirtualDisplayButton: Boolean,
     val gridPreviewIntervalMs: Int,
     val clipLivePreview: Boolean,
@@ -73,6 +76,9 @@ class SettingsManager(private val context: Context) {
         private val STREAM_FPS_KEY = intPreferencesKey("stream_fps")
         private val HARDWARE_ENCODING_KEY = booleanPreferencesKey("hardware_encoding")
         private val HIGH_PERFORMANCE_WINDOW_STREAMING_KEY = booleanPreferencesKey("high_performance_window_streaming")
+        private val ENABLE_AUDIO_KEY = booleanPreferencesKey("enable_audio")
+        private val AUDIO_DELAY_MS_KEY = intPreferencesKey("audio_delay_ms")
+        private val AUDIO_BUFFER_MS_KEY = intPreferencesKey("audio_buffer_ms")
         private val SHOW_VIRTUAL_DISPLAY_BUTTON_KEY = booleanPreferencesKey("show_virtual_display_button")
         private val GRID_PREVIEW_INTERVAL_MS_KEY = intPreferencesKey("grid_preview_interval_ms")
         private val CLIP_LIVE_PREVIEW_KEY = booleanPreferencesKey("clip_live_preview")
@@ -130,6 +136,9 @@ class SettingsManager(private val context: Context) {
             streamFps = pref[STREAM_FPS_KEY] ?: 30,
             useHardwareEncoding = pref[HARDWARE_ENCODING_KEY] ?: false,
             useHighPerformanceWindowStreaming = pref[HIGH_PERFORMANCE_WINDOW_STREAMING_KEY] ?: false,
+            enableAudio = pref[ENABLE_AUDIO_KEY] ?: false,
+            audioDelayMs = pref[AUDIO_DELAY_MS_KEY] ?: 0,
+            audioBufferMs = pref[AUDIO_BUFFER_MS_KEY] ?: 60,
             showVirtualDisplayButton = pref[SHOW_VIRTUAL_DISPLAY_BUTTON_KEY] ?: true,
             gridPreviewIntervalMs = pref[GRID_PREVIEW_INTERVAL_MS_KEY] ?: 2000,
             clipLivePreview = pref[CLIP_LIVE_PREVIEW_KEY] ?: false,
@@ -169,6 +178,9 @@ class SettingsManager(private val context: Context) {
             pref[STREAM_FPS_KEY] = settings.streamFps
             pref[HARDWARE_ENCODING_KEY] = settings.useHardwareEncoding
             pref[HIGH_PERFORMANCE_WINDOW_STREAMING_KEY] = settings.useHighPerformanceWindowStreaming
+            pref[ENABLE_AUDIO_KEY] = settings.enableAudio
+            pref[AUDIO_DELAY_MS_KEY] = settings.audioDelayMs
+            pref[AUDIO_BUFFER_MS_KEY] = settings.audioBufferMs
             pref[SHOW_VIRTUAL_DISPLAY_BUTTON_KEY] = settings.showVirtualDisplayButton
             pref[GRID_PREVIEW_INTERVAL_MS_KEY] = settings.gridPreviewIntervalMs
             pref[CLIP_LIVE_PREVIEW_KEY] = settings.clipLivePreview

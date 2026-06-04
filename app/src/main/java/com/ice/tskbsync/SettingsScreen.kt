@@ -37,6 +37,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val shortcuts by viewModel.shortcuts
     val windowFilter by viewModel.windowFilter
     val h264Status by viewModel.h264Status
+    val audioStatus by viewModel.audioStatus
     val extendedDisplayStatus by viewModel.extendedDisplayStatus
     val extendedDisplayDriverChanging by viewModel.extendedDisplayDriverChanging
     
@@ -87,7 +88,16 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
             }
         ) { padding ->
             var selectedTab by remember { mutableIntStateOf(0) }
-            val tabs = listOf("Connection", "Display", "Appearance", "Shortcuts")
+            val tabs = listOf(
+                "Connection",
+                "Layout",
+                "Streaming",
+                "Audio",
+                "Virtual Display",
+                "Appearance",
+                "Shortcuts",
+                "Advanced"
+            )
 
             val settingsContent: @Composable (Modifier) -> Unit = { contentModifier ->
                 LazyColumn(
@@ -97,8 +107,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                     when (selectedTab) {
                         0 -> item {
                             SectionTitle("Connection", themeColor)
-                            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-                                Column(Modifier.padding(16.dp)) {
+                            SettingsSection("Server") {
                                     var expanded by remember { mutableStateOf(false) }
                                     Box {
                                         OutlinedTextField(
@@ -145,280 +154,290 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     ) {
                                         Text("Apply and Connect", fontWeight = FontWeight.Bold)
                                     }
-                                }
                             }
                         }
 
                         1 -> item {
-                            SectionTitle("Display", themeColor)
-                            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-                                Column(Modifier.padding(16.dp)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text("Grid Columns: $gridCols")
-                                        Slider(
-                                            value = gridCols.toFloat(),
-                                            onValueChange = { viewModel.updateDisplaySettings(it.toInt(), showTitles) },
-                                            valueRange = 2f..12f,
-                                            steps = 9,
-                                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
-                                        )
-                                    }
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("Show Window Titles", modifier = Modifier.weight(1f))
-                                        Switch(checked = showTitles, onCheckedChange = { viewModel.updateDisplaySettings(gridCols, it) })
-                                    }
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("Show Window Previews", modifier = Modifier.weight(1f))
-                                        Switch(checked = theme.showPreviews, onCheckedChange = { viewModel.updateTheme(theme.copy(showPreviews = it)) })
-                                    }
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("Clip Large Preview Corners", modifier = Modifier.weight(1f))
-                                        Switch(
-                                            checked = theme.clipLivePreview,
-                                            onCheckedChange = { viewModel.updateTheme(theme.copy(clipLivePreview = it)) }
-                                        )
-                                    }
-                                    StreamSlider("Large Preview Corner", theme.livePreviewCornerPx, " px", 0f..64f, 15) {
-                                        viewModel.updateTheme(theme.copy(livePreviewCornerPx = it))
-                                    }
-                                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-                                    StreamSlider("Stream Resolution", theme.streamMaxDim, "p", 360f..3840f, 28) {
-                                        viewModel.updateTheme(theme.copy(streamMaxDim = it))
-                                    }
-                                    StreamSlider("Stream Quality", theme.streamQuality, "%", 35f..100f, 12) {
-                                        viewModel.updateTheme(theme.copy(streamQuality = it))
-                                    }
-                                    StreamSlider("Stream FPS", theme.streamFps, " fps", 5f..160f, 30) {
-                                        viewModel.updateTheme(theme.copy(streamFps = it))
-                                    }
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("Use Hardware Encoding for Screen Streaming", modifier = Modifier.weight(1f))
-                                        Switch(
-                                            checked = theme.useHardwareEncoding,
-                                            onCheckedChange = { viewModel.updateTheme(theme.copy(useHardwareEncoding = it)) }
-                                        )
-                                    }
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("High Performance Window Streaming", modifier = Modifier.weight(1f))
-                                        Switch(
-                                            checked = theme.useHighPerformanceWindowStreaming,
-                                            onCheckedChange = { viewModel.updateTheme(theme.copy(useHighPerformanceWindowStreaming = it)) }
-                                        )
-                                    }
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("Show Virtual Display Button", modifier = Modifier.weight(1f))
-                                        Switch(
-                                            checked = theme.showVirtualDisplayButton,
-                                            onCheckedChange = { viewModel.updateTheme(theme.copy(showVirtualDisplayButton = it)) }
-                                        )
-                                    }
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text("Enable Virtual Display Driver")
-                                            val statusText = when {
-                                                extendedDisplayStatus == null -> "Status not loaded"
-                                                extendedDisplayStatus?.requires_admin == true -> "Run PC backend as administrator"
-                                                extendedDisplayDriverChanging -> "Updating..."
-                                                extendedDisplayStatus?.driver_enabled == false && extendedDisplayStatus?.available == false -> "Disabled"
-                                                extendedDisplayStatus?.driver_control_available != true -> "No compatible VDD found"
-                                                else -> extendedDisplayStatus?.driver_status?.ifBlank { extendedDisplayStatus?.message } ?: ""
-                                            }
-                                            Text(statusText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Switch(
-                                            checked = extendedDisplayStatus?.driver_enabled == true,
-                                            enabled = extendedDisplayStatus?.driver_control_available == true &&
-                                                extendedDisplayStatus?.requires_admin != true &&
-                                                !extendedDisplayDriverChanging,
-                                            onCheckedChange = { viewModel.setExtendedDisplayDriverEnabled(it) }
-                                        )
-                                    }
-                                    H264StatusPanel(
-                                        status = h264Status,
-                                        enabled = theme.useHardwareEncoding,
-                                        onRefresh = { viewModel.fetchH264Status(refresh = true) }
-                                    )
-                                    StreamSlider("Grid Refresh", theme.gridPreviewIntervalMs, " ms", 500f..3000f, 24) {
-                                        viewModel.updateTheme(theme.copy(gridPreviewIntervalMs = it))
-                                    }
-
-                                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-                                    Text("Window Filter", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("Enable Window Filter", modifier = Modifier.weight(1f))
-                                        Switch(
-                                            checked = windowFilter.enabled,
-                                            onCheckedChange = { viewModel.updateWindowFilter(windowFilter.copy(enabled = it)) }
-                                        )
-                                    }
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                        Text("Hide Common System Windows", modifier = Modifier.weight(1f))
-                                        Switch(
-                                            checked = windowFilter.hideSystemWindows,
-                                            onCheckedChange = { viewModel.updateWindowFilter(windowFilter.copy(hideSystemWindows = it)) }
-                                        )
-                                    }
-                                    OutlinedTextField(
-                                        value = titleFilterText,
-                                        onValueChange = {
-                                            titleFilterText = it
-                                            viewModel.updateWindowFilter(windowFilter.copy(
-                                                titleContains = parseRuleLines(it),
-                                                processNames = parseRuleLines(processFilterText),
-                                                classNames = parseRuleLines(classFilterText)
-                                            ))
-                                        },
-                                        label = { Text("Title keywords, one per line") },
-                                        modifier = Modifier.fillMaxWidth(),
-                                        minLines = 2,
-                                        maxLines = 4
-                                    )
-                                    Spacer(Modifier.height(8.dp))
-                                    OutlinedTextField(
-                                        value = processFilterText,
-                                        onValueChange = {
-                                            processFilterText = it
-                                            viewModel.updateWindowFilter(windowFilter.copy(
-                                                titleContains = parseRuleLines(titleFilterText),
-                                                processNames = parseRuleLines(it),
-                                                classNames = parseRuleLines(classFilterText)
-                                            ))
-                                        },
-                                        label = { Text("Process names, one per line") },
-                                        supportingText = { Text("Example: TextInputHost.exe") },
-                                        modifier = Modifier.fillMaxWidth(),
-                                        minLines = 2,
-                                        maxLines = 4
-                                    )
-                                    Spacer(Modifier.height(8.dp))
-                                    OutlinedTextField(
-                                        value = classFilterText,
-                                        onValueChange = {
-                                            classFilterText = it
-                                            viewModel.updateWindowFilter(windowFilter.copy(
-                                                titleContains = parseRuleLines(titleFilterText),
-                                                processNames = parseRuleLines(processFilterText),
-                                                classNames = parseRuleLines(it)
-                                            ))
-                                        },
-                                        label = { Text("Window class names, one per line") },
-                                        modifier = Modifier.fillMaxWidth(),
-                                        minLines = 2,
-                                        maxLines = 4
-                                    )
-                                    TextButton(
-                                        onClick = {
-                                            titleFilterText = ""
-                                            processFilterText = ""
-                                            classFilterText = ""
-                                            viewModel.updateWindowFilter(WindowFilterSettings())
-                                        }
-                                    ) {
-                                        Icon(Icons.Default.Restore, null)
-                                        Spacer(Modifier.width(6.dp))
-                                        Text("Restore Default Filter")
-                                    }
+                            SectionTitle("Layout", themeColor)
+                            SettingsSection("Grid") {
+                                SettingsSliderRow("Grid Columns", gridCols, "", 2f..12f, 9) {
+                                    viewModel.updateDisplaySettings(it, showTitles)
+                                }
+                                SettingsSwitchRow(
+                                    title = "Show Window Titles",
+                                    checked = showTitles,
+                                    onCheckedChange = { viewModel.updateDisplaySettings(gridCols, it) }
+                                )
+                                SettingsSwitchRow(
+                                    title = "Show Window Previews",
+                                    checked = theme.showPreviews,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(showPreviews = it)) }
+                                )
+                                SettingsSliderRow("Grid Refresh", theme.gridPreviewIntervalMs, " ms", 500f..3000f, 24) {
+                                    viewModel.updateTheme(theme.copy(gridPreviewIntervalMs = it))
                                 }
                             }
                         }
 
                         2 -> item {
+                            SectionTitle("Streaming", themeColor)
+                            SettingsSection("Video") {
+                                SettingsSliderRow("Stream Resolution", theme.streamMaxDim, "p", 360f..3840f, 28) {
+                                    viewModel.updateTheme(theme.copy(streamMaxDim = it))
+                                }
+                                SettingsSliderRow("Stream Quality", theme.streamQuality, "%", 35f..100f, 12) {
+                                    viewModel.updateTheme(theme.copy(streamQuality = it))
+                                }
+                                SettingsSliderRow("Stream FPS", theme.streamFps, " fps", 5f..160f, 30) {
+                                    viewModel.updateTheme(theme.copy(streamFps = it))
+                                }
+                            }
+                            SettingsSection("Preview") {
+                                SettingsSwitchRow(
+                                    title = "Clip Large Preview Corners",
+                                    checked = theme.clipLivePreview,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(clipLivePreview = it)) }
+                                )
+                                SettingsSliderRow("Large Preview Corner", theme.livePreviewCornerPx, " px", 0f..64f, 15) {
+                                    viewModel.updateTheme(theme.copy(livePreviewCornerPx = it))
+                                }
+                            }
+                            SettingsSection("Performance") {
+                                SettingsSwitchRow(
+                                    title = "Use Hardware Encoding for Screen Streaming",
+                                    checked = theme.useHardwareEncoding,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(useHardwareEncoding = it)) }
+                                )
+                                SettingsSwitchRow(
+                                    title = "High Performance Window Streaming",
+                                    checked = theme.useHighPerformanceWindowStreaming,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(useHighPerformanceWindowStreaming = it)) }
+                                )
+                            }
+                        }
+
+                        3 -> item {
+                            SectionTitle("Audio", themeColor)
+                            SettingsSection("Playback") {
+                                SettingsSwitchRow(
+                                    title = "Enable Audio",
+                                    subtitle = audioStatus ?: "PC system audio plays only during live preview/control",
+                                    checked = theme.enableAudio,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(enableAudio = it)) }
+                                )
+                                SettingsSliderRow("Audio Delay", theme.audioDelayMs, " ms", -300f..500f, 15) {
+                                    viewModel.updateTheme(theme.copy(audioDelayMs = it))
+                                }
+                                SettingsSliderRow("Audio Buffer", theme.audioBufferMs, " ms", 20f..240f, 21) {
+                                    viewModel.updateTheme(theme.copy(audioBufferMs = it))
+                                }
+                            }
+                        }
+
+                        4 -> item {
+                            SectionTitle("Virtual Display", themeColor)
+                            SettingsSection("Entry") {
+                                SettingsSwitchRow(
+                                    title = "Show Virtual Display Button",
+                                    checked = theme.showVirtualDisplayButton,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(showVirtualDisplayButton = it)) }
+                                )
+                            }
+                            SettingsSection("Driver") {
+                                val statusText = when {
+                                    extendedDisplayStatus == null -> "Status not loaded"
+                                    extendedDisplayStatus?.requires_admin == true -> "Run PC backend as administrator"
+                                    extendedDisplayDriverChanging -> "Updating..."
+                                    extendedDisplayStatus?.driver_enabled == false && extendedDisplayStatus?.available == false -> "Disabled"
+                                    extendedDisplayStatus?.driver_control_available != true -> "No compatible VDD found"
+                                    else -> extendedDisplayStatus?.driver_status?.ifBlank { extendedDisplayStatus?.message } ?: ""
+                                }
+                                SettingsSwitchRow(
+                                    title = "Enable Virtual Display Driver",
+                                    subtitle = statusText,
+                                    checked = extendedDisplayStatus?.driver_enabled == true,
+                                    enabled = extendedDisplayStatus?.driver_control_available == true &&
+                                        extendedDisplayStatus?.requires_admin != true &&
+                                        !extendedDisplayDriverChanging,
+                                    onCheckedChange = { viewModel.setExtendedDisplayDriverEnabled(it) }
+                                )
+                            }
+                        }
+
+                        5 -> item {
                             SectionTitle("Appearance", themeColor)
-                            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-                                Column {
-                                    ColorListItem("Theme Accent", Color(theme.color)) { colorPickerMode = "accent"; showColorDialog = true }
-                                    ColorListItem("Text Color", Color(theme.titleColor)) { colorPickerMode = "text"; showColorDialog = true }
-                                    ColorListItem("Container Bg", Color(theme.containerColor)) { colorPickerMode = "container"; showColorDialog = true }
-                                    ColorListItem("Top Bar Color", Color(theme.topBarColor)) { colorPickerMode = "topbar"; showColorDialog = true }
-
-                                    OpacitySlider("Grid Opacity", tempContainerAlpha) {
-                                        tempContainerAlpha = it
-                                        viewModel.updateTheme(theme.copy(containerAlpha = it))
-                                    }
-                                    OpacitySlider("Row Opacity", tempRowAlpha) {
-                                        tempRowAlpha = it
-                                        viewModel.updateTheme(theme.copy(rowContainerAlpha = it))
-                                    }
-                                    OpacitySlider("Top Bar Opacity", tempTopBarAlpha) {
-                                        tempTopBarAlpha = it
-                                        viewModel.updateTheme(theme.copy(topBarAlpha = it))
-                                    }
-
-                                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
-
-                                    ListItem(
-                                        headlineContent = { Text("Wallpaper") },
-                                        leadingContent = { Icon(Icons.Default.Image, null) },
-                                        trailingContent = {
-                                            IconButton(onClick = { launcher.launch("image/*") }) {
-                                                Icon(if (theme.bgImagePath.isEmpty()) Icons.Default.FileUpload else Icons.Default.Cached, null)
-                                            }
+                            SettingsSection("Colors") {
+                                ColorListItem("Theme Accent", Color(theme.color)) { colorPickerMode = "accent"; showColorDialog = true }
+                                ColorListItem("Text Color", Color(theme.titleColor)) { colorPickerMode = "text"; showColorDialog = true }
+                                ColorListItem("Container Bg", Color(theme.containerColor)) { colorPickerMode = "container"; showColorDialog = true }
+                                ColorListItem("Top Bar Color", Color(theme.topBarColor)) { colorPickerMode = "topbar"; showColorDialog = true }
+                            }
+                            SettingsSection("Opacity") {
+                                OpacitySlider("Grid Opacity", tempContainerAlpha) {
+                                    tempContainerAlpha = it
+                                    viewModel.updateTheme(theme.copy(containerAlpha = it))
+                                }
+                                OpacitySlider("Row Opacity", tempRowAlpha) {
+                                    tempRowAlpha = it
+                                    viewModel.updateTheme(theme.copy(rowContainerAlpha = it))
+                                }
+                                OpacitySlider("Top Bar Opacity", tempTopBarAlpha) {
+                                    tempTopBarAlpha = it
+                                    viewModel.updateTheme(theme.copy(topBarAlpha = it))
+                                }
+                            }
+                            SettingsSection("Wallpaper") {
+                                ListItem(
+                                    headlineContent = { Text("Wallpaper") },
+                                    leadingContent = { Icon(Icons.Default.Image, null) },
+                                    trailingContent = {
+                                        IconButton(onClick = { launcher.launch("image/*") }) {
+                                            Icon(if (theme.bgImagePath.isEmpty()) Icons.Default.FileUpload else Icons.Default.Cached, null)
                                         }
+                                    },
+                                    colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                                )
+                                if (theme.bgImagePath.isNotEmpty()) {
+                                    SettingsSwitchRow(
+                                        title = "Show Wallpaper",
+                                        checked = theme.showWallpaper,
+                                        onCheckedChange = { viewModel.updateTheme(theme.copy(showWallpaper = it)) }
                                     )
-                                    if (theme.bgImagePath.isNotEmpty()) {
-                                        Column(Modifier.padding(16.dp)) {
-                                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                                Text("Show Wallpaper", modifier = Modifier.weight(1f))
-                                                Switch(
-                                                    checked = theme.showWallpaper,
-                                                    onCheckedChange = { viewModel.updateTheme(theme.copy(showWallpaper = it)) }
-                                                )
-                                            }
-                                            OpacitySlider("Wallpaper Opacity", tempBgAlpha) {
-                                                tempBgAlpha = it
-                                                viewModel.updateTheme(theme.copy(bgAlpha = it))
-                                            }
-                                        }
+                                    OpacitySlider("Wallpaper Opacity", tempBgAlpha) {
+                                        tempBgAlpha = it
+                                        viewModel.updateTheme(theme.copy(bgAlpha = it))
                                     }
                                 }
                             }
                         }
 
-                        3 -> item {
+                        6 -> item {
                             SectionTitle("Shortcuts", themeColor)
-                            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-                                Column {
-                                    shortcuts.forEachIndexed { index, shortcut ->
-                                        ListItem(
-                                            headlineContent = { Text(shortcut.label) },
-                                            supportingContent = { Text(shortcut.keys.joinToString(" + ")) },
-                                            leadingContent = { Icon(Icons.Default.KeyboardCommandKey, null) },
-                                            trailingContent = {
-                                                Row {
-                                                    IconButton(onClick = { editingShortcutIndex = index }) {
-                                                        Icon(Icons.Default.Edit, null)
-                                                    }
-                                                    IconButton(onClick = {
-                                                        viewModel.saveShortcuts(shortcuts.filterIndexed { i, _ -> i != index })
-                                                    }) {
-                                                        Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
-                                                    }
+                            SettingsSection("Commands") {
+                                shortcuts.forEachIndexed { index, shortcut ->
+                                    ListItem(
+                                        headlineContent = { Text(shortcut.label) },
+                                        supportingContent = { Text(shortcut.keys.joinToString(" + ")) },
+                                        leadingContent = { Icon(Icons.Default.KeyboardCommandKey, null) },
+                                        trailingContent = {
+                                            Row {
+                                                IconButton(onClick = { editingShortcutIndex = index }) {
+                                                    Icon(Icons.Default.Edit, null)
+                                                }
+                                                IconButton(onClick = {
+                                                    viewModel.saveShortcuts(shortcuts.filterIndexed { i, _ -> i != index })
+                                                }) {
+                                                    Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
                                                 }
                                             }
-                                        )
-                                    }
-                                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(16.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                        },
+                                        colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                                    )
+                                }
+                                HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = { editingShortcutIndex = shortcuts.size },
+                                        modifier = Modifier.weight(1f)
                                     ) {
-                                        OutlinedButton(
-                                            onClick = { editingShortcutIndex = shortcuts.size },
-                                            modifier = Modifier.weight(1f)
-                                        ) {
-                                            Icon(Icons.Default.Add, null)
-                                            Spacer(Modifier.width(6.dp))
-                                            Text("Add")
-                                        }
-                                        Button(
-                                            onClick = { viewModel.restoreDefaultShortcuts() },
-                                            modifier = Modifier.weight(1f)
-                                        ) {
-                                            Icon(Icons.Default.Restore, null)
-                                            Spacer(Modifier.width(6.dp))
-                                            Text("Defaults")
-                                        }
+                                        Icon(Icons.Default.Add, null)
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("Add")
                                     }
+                                    Button(
+                                        onClick = { viewModel.restoreDefaultShortcuts() },
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(Icons.Default.Restore, null)
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("Defaults")
+                                    }
+                                }
+                            }
+                        }
+
+                        7 -> item {
+                            SectionTitle("Advanced", themeColor)
+                            SettingsSection("Hardware Encoder Diagnostics") {
+                                H264StatusPanel(
+                                    status = h264Status,
+                                    enabled = theme.useHardwareEncoding,
+                                    onRefresh = { viewModel.fetchH264Status(refresh = true) }
+                                )
+                            }
+                            SettingsSection("Window Filter") {
+                                SettingsSwitchRow(
+                                    title = "Enable Window Filter",
+                                    checked = windowFilter.enabled,
+                                    onCheckedChange = { viewModel.updateWindowFilter(windowFilter.copy(enabled = it)) }
+                                )
+                                SettingsSwitchRow(
+                                    title = "Hide Common System Windows",
+                                    checked = windowFilter.hideSystemWindows,
+                                    onCheckedChange = { viewModel.updateWindowFilter(windowFilter.copy(hideSystemWindows = it)) }
+                                )
+                                OutlinedTextField(
+                                    value = titleFilterText,
+                                    onValueChange = {
+                                        titleFilterText = it
+                                        viewModel.updateWindowFilter(windowFilter.copy(
+                                            titleContains = parseRuleLines(it),
+                                            processNames = parseRuleLines(processFilterText),
+                                            classNames = parseRuleLines(classFilterText)
+                                        ))
+                                    },
+                                    label = { Text("Title keywords, one per line") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    minLines = 2,
+                                    maxLines = 4
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = processFilterText,
+                                    onValueChange = {
+                                        processFilterText = it
+                                        viewModel.updateWindowFilter(windowFilter.copy(
+                                            titleContains = parseRuleLines(titleFilterText),
+                                            processNames = parseRuleLines(it),
+                                            classNames = parseRuleLines(classFilterText)
+                                        ))
+                                    },
+                                    label = { Text("Process names, one per line") },
+                                    supportingText = { Text("Example: TextInputHost.exe") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    minLines = 2,
+                                    maxLines = 4
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = classFilterText,
+                                    onValueChange = {
+                                        classFilterText = it
+                                        viewModel.updateWindowFilter(windowFilter.copy(
+                                            titleContains = parseRuleLines(titleFilterText),
+                                            processNames = parseRuleLines(processFilterText),
+                                            classNames = parseRuleLines(it)
+                                        ))
+                                    },
+                                    label = { Text("Window class names, one per line") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    minLines = 2,
+                                    maxLines = 4
+                                )
+                                TextButton(
+                                    onClick = {
+                                        titleFilterText = ""
+                                        processFilterText = ""
+                                        classFilterText = ""
+                                        viewModel.updateWindowFilter(WindowFilterSettings())
+                                    }
+                                ) {
+                                    Icon(Icons.Default.Restore, null)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Restore Default Filter")
                                 }
                             }
                         }
@@ -441,7 +460,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                     }
                 } else {
                     Column(modifier = Modifier.fillMaxSize()) {
-                        TabRow(selectedTabIndex = selectedTab) {
+                        ScrollableTabRow(selectedTabIndex = selectedTab, edgePadding = 12.dp) {
                             tabs.forEachIndexed { index, label ->
                                 Tab(
                                     selected = selectedTab == index,
@@ -499,6 +518,85 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                 viewModel.saveShortcuts(next)
                 editingShortcutIndex = null
             }
+        )
+    }
+}
+
+@Composable
+fun SettingsSection(
+    title: String,
+    subtitle: String? = null,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp), shape = RoundedCornerShape(16.dp)) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold
+            )
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            content()
+        }
+    }
+}
+
+@Composable
+fun SettingsSwitchRow(
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    subtitle: String? = null,
+    enabled: Boolean = true
+) {
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = subtitle?.takeIf { it.isNotBlank() }?.let {
+            {
+                Text(
+                    text = it,
+                    maxLines = 2,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        trailingContent = {
+            Switch(
+                checked = checked,
+                enabled = enabled,
+                onCheckedChange = onCheckedChange
+            )
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+    )
+}
+
+@Composable
+fun SettingsSliderRow(
+    label: String,
+    value: Int,
+    suffix: String,
+    range: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    onValueChange: (Int) -> Unit
+) {
+    Column(Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) {
+        Text("$label: $value$suffix", style = MaterialTheme.typography.bodySmall)
+        Slider(
+            value = value.toFloat(),
+            onValueChange = { onValueChange(it.roundToInt()) },
+            valueRange = range,
+            steps = steps
         )
     }
 }
