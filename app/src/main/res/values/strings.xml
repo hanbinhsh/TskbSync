@@ -1,3 +1,9 @@
 <resources>
     <string name="app_name">TskbSync</string>
+    <string name="widget_description">TskbSync taskbar widget</string>
+    <string name="widget_loading">Refreshing...</string>
+    <string name="widget_refresh">Refresh</string>
+    <string name="widget_previous">Previous windows</string>
+    <string name="widget_next">Next windows</string>
+    <string name="widget_window_icon">Window icon</string>
 </resources>

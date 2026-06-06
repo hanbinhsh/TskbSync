@@ -1860,6 +1860,12 @@ async def set_window_filter(request: Request):
 async def screens_endpoint():
     return get_screens_list()
 
+@app.get("/windows")
+async def windows_endpoint(request: Request):
+    if request.headers.get("password") != PASSWORD:
+        return JSONResponse(status_code=401, content={"message": "Invalid password"})
+    return get_windows_list_minimal()
+
 def _authorized_request(request: Request):
     return request.headers.get("password") == PASSWORD
 

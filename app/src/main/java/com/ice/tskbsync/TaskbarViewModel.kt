@@ -102,7 +102,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _password = mutableStateOf("")
     val password: State<String> = _password
 
-    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, false, 0, 60, true, 2000, false, 18))
+    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, false, 0, 60, true, true, 0xFF202124.toInt(), 0.87f, 56, true, 2000, false, 18, true, true, true, true, false))
     val theme: State<ThemeSettings> = _theme
 
     private val _layoutMode = mutableStateOf("grid")
@@ -216,6 +216,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                         _isConnected.value = true
                         _error.value = null
                         reconnectDelay = reconnectBaseDelayMs
+                        TaskbarWidgetProvider.updateAll(getApplication())
                         startAudioStreamIfEnabled()
 
                         for (frame in incoming) {
@@ -850,7 +851,11 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun updateSettings(ip: String, pass: String) {
-        viewModelScope.launch { settingsManager.savePcIp(ip); settingsManager.savePassword(pass) }
+        viewModelScope.launch {
+            settingsManager.savePcIp(ip)
+            settingsManager.savePassword(pass)
+            TaskbarWidgetProvider.updateAll(getApplication())
+        }
     }
 
     fun updateDisplaySettings(cols: Int, show: Boolean) {
@@ -883,7 +888,18 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 stopAudioStream()
             }
         }
-        viewModelScope.launch { settingsManager.saveTheme(newTheme) }
+        viewModelScope.launch {
+            settingsManager.saveTheme(newTheme)
+            if (
+                newTheme.showWidgetTitles != oldTheme.showWidgetTitles ||
+                newTheme.widgetBackgroundColor != oldTheme.widgetBackgroundColor ||
+                newTheme.widgetBackgroundAlpha != oldTheme.widgetBackgroundAlpha ||
+                newTheme.widgetItemSizeDp != oldTheme.widgetItemSizeDp ||
+                newTheme.widgetTransparentOnError != oldTheme.widgetTransparentOnError
+            ) {
+                TaskbarWidgetProvider.updateAll(getApplication())
+            }
+        }
     }
 
     private suspend fun applyBackendStreamConfig(settings: ThemeSettings, ipOverride: String? = null) {

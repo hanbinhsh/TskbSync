@@ -1,5 +1,6 @@
 package com.ice.tskbsync
 
+import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,6 +20,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -57,6 +59,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     
     val themeColor = Color(theme.color)
     val titleColor = Color(theme.titleColor)
+    val context = LocalContext.current
 
     LaunchedEffect(pcIp) {
         if (pcIp.isNotEmpty()) {
@@ -92,6 +95,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                 "Connection",
                 "Layout",
                 "Streaming",
+                "Fullscreen",
                 "Audio",
                 "Virtual Display",
                 "Appearance",
@@ -173,6 +177,18 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     checked = theme.showPreviews,
                                     onCheckedChange = { viewModel.updateTheme(theme.copy(showPreviews = it)) }
                                 )
+                                SettingsSwitchRow(
+                                    title = "Show Widget Titles",
+                                    subtitle = "Only affects the Android home screen widget",
+                                    checked = theme.showWidgetTitles,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(showWidgetTitles = it)) }
+                                )
+                                Button(
+                                    onClick = { context.startActivity(Intent(context, TaskbarWidgetConfigActivity::class.java)) },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Open Widget Settings")
+                                }
                                 SettingsSliderRow("Grid Refresh", theme.gridPreviewIntervalMs, " ms", 500f..3000f, 24) {
                                     viewModel.updateTheme(theme.copy(gridPreviewIntervalMs = it))
                                 }
@@ -217,6 +233,42 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                         }
 
                         3 -> item {
+                            SectionTitle("Fullscreen", themeColor)
+                            SettingsSection("Side Controls") {
+                                SettingsSwitchRow(
+                                    title = "Enable Fullscreen Side Controls",
+                                    subtitle = "Show a small toggle in fullscreen black bars",
+                                    checked = theme.fullscreenSideControlsEnabled,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(fullscreenSideControlsEnabled = it)) }
+                                )
+                                SettingsSwitchRow(
+                                    title = "Show Mode Switch",
+                                    subtitle = "Touch / Mouse controls in the fullscreen side panel",
+                                    checked = theme.fullscreenShowModeSwitch,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(fullscreenShowModeSwitch = it)) }
+                                )
+                                SettingsSwitchRow(
+                                    title = "Show Window Controls",
+                                    subtitle = "Window, screen, and mouse quick controls in fullscreen",
+                                    checked = theme.fullscreenShowWindowControls,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(fullscreenShowWindowControls = it)) }
+                                )
+                                SettingsSwitchRow(
+                                    title = "Show Shortcuts",
+                                    subtitle = "Custom shortcut buttons in fullscreen",
+                                    checked = theme.fullscreenShowShortcuts,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(fullscreenShowShortcuts = it)) }
+                                )
+                                SettingsSwitchRow(
+                                    title = "Remember Panel Open State",
+                                    subtitle = "Use the last fullscreen side panel state next time",
+                                    checked = theme.fullscreenRememberPanelOpen,
+                                    onCheckedChange = { viewModel.updateTheme(theme.copy(fullscreenRememberPanelOpen = it)) }
+                                )
+                            }
+                        }
+
+                        4 -> item {
                             SectionTitle("Audio", themeColor)
                             SettingsSection("Playback") {
                                 SettingsSwitchRow(
@@ -234,7 +286,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        4 -> item {
+                        5 -> item {
                             SectionTitle("Virtual Display", themeColor)
                             SettingsSection("Entry") {
                                 SettingsSwitchRow(
@@ -264,7 +316,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        5 -> item {
+                        6 -> item {
                             SectionTitle("Appearance", themeColor)
                             SettingsSection("Colors") {
                                 ColorListItem("Theme Accent", Color(theme.color)) { colorPickerMode = "accent"; showColorDialog = true }
@@ -311,7 +363,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        6 -> item {
+                        7 -> item {
                             SectionTitle("Shortcuts", themeColor)
                             SettingsSection("Commands") {
                                 shortcuts.forEachIndexed { index, shortcut ->
@@ -359,7 +411,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        7 -> item {
+                        8 -> item {
                             SectionTitle("Advanced", themeColor)
                             SettingsSection("Hardware Encoder Diagnostics") {
                                 H264StatusPanel(

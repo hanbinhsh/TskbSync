@@ -47,9 +47,19 @@ data class ThemeSettings(
     val audioDelayMs: Int,
     val audioBufferMs: Int,
     val showVirtualDisplayButton: Boolean,
+    val showWidgetTitles: Boolean,
+    val widgetBackgroundColor: Int,
+    val widgetBackgroundAlpha: Float,
+    val widgetItemSizeDp: Int,
+    val widgetTransparentOnError: Boolean,
     val gridPreviewIntervalMs: Int,
     val clipLivePreview: Boolean,
-    val livePreviewCornerPx: Int
+    val livePreviewCornerPx: Int,
+    val fullscreenSideControlsEnabled: Boolean,
+    val fullscreenShowModeSwitch: Boolean,
+    val fullscreenShowWindowControls: Boolean,
+    val fullscreenShowShortcuts: Boolean,
+    val fullscreenRememberPanelOpen: Boolean
 )
 
 class SettingsManager(private val context: Context) {
@@ -80,9 +90,19 @@ class SettingsManager(private val context: Context) {
         private val AUDIO_DELAY_MS_KEY = intPreferencesKey("audio_delay_ms")
         private val AUDIO_BUFFER_MS_KEY = intPreferencesKey("audio_buffer_ms")
         private val SHOW_VIRTUAL_DISPLAY_BUTTON_KEY = booleanPreferencesKey("show_virtual_display_button")
+        private val SHOW_WIDGET_TITLES_KEY = booleanPreferencesKey("show_widget_titles")
+        private val WIDGET_BACKGROUND_COLOR_KEY = intPreferencesKey("widget_background_color")
+        private val WIDGET_BACKGROUND_ALPHA_KEY = floatPreferencesKey("widget_background_alpha")
+        private val WIDGET_ITEM_SIZE_DP_KEY = intPreferencesKey("widget_item_size_dp")
+        private val WIDGET_TRANSPARENT_ON_ERROR_KEY = booleanPreferencesKey("widget_transparent_on_error")
         private val GRID_PREVIEW_INTERVAL_MS_KEY = intPreferencesKey("grid_preview_interval_ms")
         private val CLIP_LIVE_PREVIEW_KEY = booleanPreferencesKey("clip_live_preview")
         private val LIVE_PREVIEW_CORNER_PX_KEY = intPreferencesKey("live_preview_corner_px")
+        private val FULLSCREEN_SIDE_CONTROLS_ENABLED_KEY = booleanPreferencesKey("fullscreen_side_controls_enabled")
+        private val FULLSCREEN_SHOW_MODE_SWITCH_KEY = booleanPreferencesKey("fullscreen_show_mode_switch")
+        private val FULLSCREEN_SHOW_WINDOW_CONTROLS_KEY = booleanPreferencesKey("fullscreen_show_window_controls")
+        private val FULLSCREEN_SHOW_SHORTCUTS_KEY = booleanPreferencesKey("fullscreen_show_shortcuts")
+        private val FULLSCREEN_REMEMBER_PANEL_OPEN_KEY = booleanPreferencesKey("fullscreen_remember_panel_open")
         private val WINDOW_FILTER_KEY = stringPreferencesKey("window_filter")
         private val SHORTCUTS_KEY = stringPreferencesKey("shortcuts")
     }
@@ -140,9 +160,19 @@ class SettingsManager(private val context: Context) {
             audioDelayMs = pref[AUDIO_DELAY_MS_KEY] ?: 0,
             audioBufferMs = pref[AUDIO_BUFFER_MS_KEY] ?: 60,
             showVirtualDisplayButton = pref[SHOW_VIRTUAL_DISPLAY_BUTTON_KEY] ?: true,
+            showWidgetTitles = pref[SHOW_WIDGET_TITLES_KEY] ?: true,
+            widgetBackgroundColor = pref[WIDGET_BACKGROUND_COLOR_KEY] ?: 0xFF202124.toInt(),
+            widgetBackgroundAlpha = pref[WIDGET_BACKGROUND_ALPHA_KEY] ?: 0.87f,
+            widgetItemSizeDp = pref[WIDGET_ITEM_SIZE_DP_KEY] ?: 56,
+            widgetTransparentOnError = pref[WIDGET_TRANSPARENT_ON_ERROR_KEY] ?: true,
             gridPreviewIntervalMs = pref[GRID_PREVIEW_INTERVAL_MS_KEY] ?: 2000,
             clipLivePreview = pref[CLIP_LIVE_PREVIEW_KEY] ?: false,
-            livePreviewCornerPx = pref[LIVE_PREVIEW_CORNER_PX_KEY] ?: 18
+            livePreviewCornerPx = pref[LIVE_PREVIEW_CORNER_PX_KEY] ?: 18,
+            fullscreenSideControlsEnabled = pref[FULLSCREEN_SIDE_CONTROLS_ENABLED_KEY] ?: true,
+            fullscreenShowModeSwitch = pref[FULLSCREEN_SHOW_MODE_SWITCH_KEY] ?: true,
+            fullscreenShowWindowControls = pref[FULLSCREEN_SHOW_WINDOW_CONTROLS_KEY] ?: true,
+            fullscreenShowShortcuts = pref[FULLSCREEN_SHOW_SHORTCUTS_KEY] ?: true,
+            fullscreenRememberPanelOpen = pref[FULLSCREEN_REMEMBER_PANEL_OPEN_KEY] ?: false
         )
     }
 
@@ -182,9 +212,19 @@ class SettingsManager(private val context: Context) {
             pref[AUDIO_DELAY_MS_KEY] = settings.audioDelayMs
             pref[AUDIO_BUFFER_MS_KEY] = settings.audioBufferMs
             pref[SHOW_VIRTUAL_DISPLAY_BUTTON_KEY] = settings.showVirtualDisplayButton
+            pref[SHOW_WIDGET_TITLES_KEY] = settings.showWidgetTitles
+            pref[WIDGET_BACKGROUND_COLOR_KEY] = settings.widgetBackgroundColor
+            pref[WIDGET_BACKGROUND_ALPHA_KEY] = settings.widgetBackgroundAlpha
+            pref[WIDGET_ITEM_SIZE_DP_KEY] = settings.widgetItemSizeDp
+            pref[WIDGET_TRANSPARENT_ON_ERROR_KEY] = settings.widgetTransparentOnError
             pref[GRID_PREVIEW_INTERVAL_MS_KEY] = settings.gridPreviewIntervalMs
             pref[CLIP_LIVE_PREVIEW_KEY] = settings.clipLivePreview
             pref[LIVE_PREVIEW_CORNER_PX_KEY] = settings.livePreviewCornerPx
+            pref[FULLSCREEN_SIDE_CONTROLS_ENABLED_KEY] = settings.fullscreenSideControlsEnabled
+            pref[FULLSCREEN_SHOW_MODE_SWITCH_KEY] = settings.fullscreenShowModeSwitch
+            pref[FULLSCREEN_SHOW_WINDOW_CONTROLS_KEY] = settings.fullscreenShowWindowControls
+            pref[FULLSCREEN_SHOW_SHORTCUTS_KEY] = settings.fullscreenShowShortcuts
+            pref[FULLSCREEN_REMEMBER_PANEL_OPEN_KEY] = settings.fullscreenRememberPanelOpen
         }
     }
 

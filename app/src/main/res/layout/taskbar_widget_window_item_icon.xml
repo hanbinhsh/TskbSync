@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widgetWindowItem"
+    android:layout_width="48dp"
+    android:layout_height="match_parent"
+    android:layout_marginEnd="6dp"
+    android:background="@drawable/taskbar_widget_item_background"
+    android:gravity="center"
+    android:orientation="vertical"
+    android:padding="5dp">
+
+    <ImageView
+        android:id="@+id/widgetWindowIcon"
+        android:layout_width="38dp"
+        android:layout_height="38dp"
+        android:contentDescription="@string/widget_window_icon"
+        android:scaleType="fitCenter"
+        android:src="@mipmap/ic_launcher" />
+
+    <TextView
+        android:id="@+id/widgetWindowTitle"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:visibility="gone" />
+</LinearLayout>

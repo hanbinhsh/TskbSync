@@ -23,9 +23,12 @@ import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.LocalOverscrollConfiguration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
@@ -59,6 +62,7 @@ import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -117,6 +121,8 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
     var showWindowControlBar by rememberSaveable { mutableStateOf(false) }
     var isFullscreenPreview by rememberSaveable { mutableStateOf(false) }
     var showFullscreenExitHint by rememberSaveable { mutableStateOf(false) }
+    var showFullscreenSidePanel by rememberSaveable { mutableStateOf(false) }
+    var fullscreenPanelMode by rememberSaveable { mutableStateOf("combo") }
     var landscapeInputMode by rememberSaveable { mutableStateOf("touch") }
     var rightPanelMode by rememberSaveable { mutableStateOf<String?>(null) } // null/window list, "mouse", "screen"
     var selectedScreenIndex by rememberSaveable { mutableStateOf<Int?>(null) }
@@ -145,6 +151,12 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
         }
     }
 
+    LaunchedEffect(isFullscreenPreview, theme.fullscreenRememberPanelOpen) {
+        if (isFullscreenPreview && !theme.fullscreenRememberPanelOpen) {
+            showFullscreenSidePanel = false
+        }
+    }
+
     DisposableEffect(isFullscreenPreview, activity) {
         val window = activity?.window
         if (isFullscreenPreview && window != null) {
@@ -158,6 +170,25 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
             if (window != null) {
                 window.insetsController?.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
                 window.setDecorFitsSystemWindows(true)
+            }
+        }
+    }
+
+    LaunchedEffect(isFullscreenPreview, selectedScreenIndex, controlledWindow?.hwnd, isConnected) {
+        if (isFullscreenPreview && isConnected) {
+            kotlinx.coroutines.delay(120)
+            selectedScreenIndex?.let { screenIndex ->
+                viewModel.startRemoteScreenInput(screenIndex)
+            } ?: controlledWindow?.hwnd?.let { hwnd ->
+                viewModel.startRemoteInput(hwnd)
+            }
+        }
+    }
+
+    DisposableEffect(isFullscreenPreview) {
+        onDispose {
+            if (isFullscreenPreview) {
+                viewModel.stopRemoteInput()
             }
         }
     }
@@ -196,12 +227,13 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         } else {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (isLandscapeSingleMode && controlledWindow != null) {
+                                if (isLandscapeSingleMode && controlledWindow != null && !showLandscapeShortcutBar) {
                                     IconButton(onClick = {
                                         isFullscreenPreview = true
                                         showFullscreenExitHint = false
                                         showLandscapeShortcutBar = false
                                         showWindowControlBar = false
+                                        if (!theme.fullscreenRememberPanelOpen) showFullscreenSidePanel = false
                                         if (selectedScreenIndex == null) {
                                             viewModel.startLiveStream(controlledWindow.hwnd)
                                         }
@@ -209,12 +241,14 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         Icon(Icons.Default.Fullscreen, null, tint = titleColor)
                                     }
                                 }
-                                IconButton(onClick = {
-                                    showWindowControlBar = true
-                                    showLandscapeShortcutBar = false
-                                    viewModel.fetchScreens()
-                                }) {
-                                    Icon(Icons.Default.OpenInNew, null, tint = titleColor)
+                                if (!showLandscapeShortcutBar) {
+                                    IconButton(onClick = {
+                                        showWindowControlBar = true
+                                        showLandscapeShortcutBar = false
+                                        viewModel.fetchScreens()
+                                    }) {
+                                        Icon(Icons.Default.OpenInNew, null, tint = titleColor)
+                                    }
                                 }
                                 if (isLandscapeSingleMode) {
                                     IconButton(onClick = {
@@ -233,77 +267,30 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                         },
                         title = {
                         if (showWindowControlBar) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState())
-                            ) {
-                                if (controlledWindow == null) {
-                                    AssistChip(
-                                        onClick = {},
-                                        label = { Text("No window", maxLines = 1) },
-                                        leadingIcon = { Icon(Icons.Default.Info, null, modifier = Modifier.size(18.dp)) }
-                                    )
-                                } else {
-                                    IconButton(onClick = { viewModel.controlWindow(controlledWindow.hwnd, "close") }) {
-                                        Icon(Icons.Default.Close, null, tint = titleColor)
-                                    }
-                                    IconButton(onClick = { viewModel.controlWindow(controlledWindow.hwnd, "minimize") }) {
-                                        Icon(Icons.Default.Minimize, null, tint = titleColor)
-                                    }
-                                    IconButton(onClick = {
-                                        viewModel.controlWindow(
-                                            controlledWindow.hwnd,
-                                            if (controlledWindow.is_maximized) "restore" else "maximize"
-                                        )
-                                    }) {
-                                        Icon(
-                                            if (controlledWindow.is_maximized) Icons.Default.CloseFullscreen else Icons.Default.OpenInFull,
-                                            null,
-                                            tint = titleColor
-                                        )
-                                    }
-                                    screens.forEach { screen ->
-                                        AssistChip(
-                                            onClick = { viewModel.controlWindow(controlledWindow.hwnd, "move_to_screen", screen.monitor_index) },
-                                            label = { Text("Display ${screen.monitor_index}", maxLines = 1) },
-                                            leadingIcon = { Icon(Icons.Default.StayCurrentLandscape, null, modifier = Modifier.size(18.dp)) }
-                                        )
-                                    }
-                                }
-                            }
+                            WindowControlBarContent(
+                                controlledWindow = controlledWindow,
+                                screens = screens,
+                                titleColor = titleColor,
+                                onWindowControl = { hwnd, action -> viewModel.controlWindow(hwnd, action) },
+                                onMoveWindowToScreen = { hwnd, screen -> viewModel.controlWindow(hwnd, "move_to_screen", screen.monitor_index) },
+                                modifier = Modifier.fillMaxWidth()
+                            )
                         } else if (isLandscapeSingleMode && showLandscapeShortcutBar) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState())
-                            ) {
-                                FilterChip(
-                                    selected = landscapeInputMode == "touch",
-                                    onClick = { landscapeInputMode = if (landscapeInputMode == "touch") "mouse" else "touch" },
-                                    label = { Text(if (landscapeInputMode == "touch") "Touch" else "Mouse") },
-                                    leadingIcon = { Icon(if (landscapeInputMode == "touch") Icons.Default.TouchApp else Icons.Default.Mouse, null, modifier = Modifier.size(18.dp)) }
-                                )
-                                IconButton(onClick = {
+                            ShortcutBarContent(
+                                inputMode = landscapeInputMode,
+                                titleColor = titleColor,
+                                shortcuts = viewModel.shortcuts.value,
+                                onToggleInputMode = { landscapeInputMode = if (landscapeInputMode == "touch") "mouse" else "touch" },
+                                onKeyboard = {
                                     coroutineScope.launch {
                                         kotlinx.coroutines.delay(80)
                                         focusRequester.requestFocus()
                                         keyboardController?.show()
                                     }
-                                }) {
-                                    Icon(Icons.Default.Keyboard, null, tint = titleColor)
-                                }
-                                viewModel.shortcuts.value.forEach { shortcut ->
-                                    AssistChip(
-                                        onClick = { viewModel.sendShortcut(shortcut) },
-                                        label = { Text(shortcut.label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
-                                    )
-                                }
-                            }
+                                },
+                                onShortcut = { viewModel.sendShortcut(it) },
+                                modifier = Modifier.fillMaxWidth()
+                            )
                         } else {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text("TskbSync", fontWeight = FontWeight.Bold, color = titleColor)
@@ -420,6 +407,83 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     onMultiTouchInput = { points -> viewModel.sendMultiTouchInput(points) }
                                 )
                             }
+                            FullscreenSideControlsOverlay(
+                                enabled = theme.fullscreenSideControlsEnabled,
+                                panelOpen = showFullscreenSidePanel,
+                                onPanelOpenChange = { showFullscreenSidePanel = it },
+                                panelMode = fullscreenPanelMode,
+                                onPanelModeChange = { fullscreenPanelMode = it },
+                                showModeSwitch = theme.fullscreenShowModeSwitch,
+                                showWindowControls = theme.fullscreenShowWindowControls,
+                                showShortcuts = theme.fullscreenShowShortcuts,
+                                rightPanelMode = rightPanelMode,
+                                windows = windows,
+                                showTitles = showTitles,
+                                showVirtualDisplayButton = theme.showVirtualDisplayButton,
+                                extendedDisplayStatus = extendedDisplayStatus,
+                                extendedDisplayConnecting = extendedDisplayConnecting,
+                                inputMode = landscapeInputMode,
+                                onToggleInputMode = { landscapeInputMode = if (landscapeInputMode == "touch") "mouse" else "touch" },
+                                onToggleMouseMode = {
+                                    rightPanelMode = if (rightPanelMode == "mouse") null else "mouse"
+                                },
+                                onToggleScreenMode = {
+                                    val next = if (rightPanelMode == "screen") null else "screen"
+                                    rightPanelMode = next
+                                    if (next == "screen") {
+                                        viewModel.fetchScreens()
+                                        viewModel.fetchExtendedDisplayStatus()
+                                    }
+                                },
+                                shortcuts = viewModel.shortcuts.value,
+                                onShortcut = { viewModel.sendShortcut(it) },
+                                onKeyboard = {
+                                    coroutineScope.launch {
+                                        kotlinx.coroutines.delay(80)
+                                        focusRequester.requestFocus()
+                                        keyboardController?.show()
+                                    }
+                                },
+                                controlledWindow = controlledWindow,
+                                screens = screens,
+                                selectedScreenIndex = selectedScreenIndex,
+                                titleColor = titleColor,
+                                accentColor = accentColor,
+                                onWindowControl = { action ->
+                                    controlledWindow?.let { viewModel.controlWindow(it.hwnd, action) }
+                                },
+                                onMoveWindowToScreen = { screen ->
+                                    controlledWindow?.let { viewModel.controlWindow(it.hwnd, "move_to_screen", screen.monitor_index) }
+                                },
+                                onExtendDisplay = {
+                                    viewModel.connectExtendedDisplay { screen ->
+                                        selectedScreenIndex = screen.monitor_index
+                                        viewModel.fetchScreens()
+                                        viewModel.startLiveScreenStream(screen.monitor_index)
+                                        viewModel.startRemoteScreenInput(screen.monitor_index)
+                                    }
+                                },
+                                onSwitchWindow = { hwnd ->
+                                    viewModel.rememberRowWindow(hwnd)
+                                    selectedScreenIndex = null
+                                    viewModel.startLiveStream(hwnd)
+                                    viewModel.startRemoteInput(hwnd)
+                                    viewModel.switchWindow(hwnd)
+                                },
+                                onScreenSelected = { screen ->
+                                    selectedScreenIndex = screen.monitor_index
+                                    viewModel.startLiveScreenStream(screen.monitor_index)
+                                    viewModel.startRemoteScreenInput(screen.monitor_index)
+                                },
+                                onFetchScreens = {
+                                    viewModel.fetchScreens()
+                                    viewModel.fetchExtendedDisplayStatus()
+                                },
+                                onMouseLeftClick = { viewModel.sendMouseButtonClick("left") },
+                                onMouseMiddleClick = { viewModel.sendMouseButtonClick("middle") },
+                                onMouseRightClick = { viewModel.sendMouseButtonClick("right") },
+                                onMouseWheel = { delta -> viewModel.sendMouseWheel(delta) }
+                            )
                         }
                         if (isAlreadyLandscape) {
                             Box(
@@ -901,6 +965,712 @@ fun CarouselPagerMode(
 }
 
 @Composable
+fun WindowControlBarContent(
+    controlledWindow: WindowInfo?,
+    screens: List<ScreenInfo>,
+    titleColor: Color,
+    onWindowControl: (Long, String) -> Unit,
+    onMoveWindowToScreen: (Long, ScreenInfo) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier.horizontalScroll(rememberScrollState())
+    ) {
+        if (controlledWindow == null) {
+            AssistChip(
+                onClick = {},
+                label = { Text("No window", maxLines = 1) },
+                leadingIcon = { Icon(Icons.Default.Info, null, modifier = Modifier.size(18.dp)) }
+            )
+        } else {
+            IconButton(onClick = { onWindowControl(controlledWindow.hwnd, "close") }) {
+                Icon(Icons.Default.Close, null, tint = titleColor)
+            }
+            IconButton(onClick = { onWindowControl(controlledWindow.hwnd, "minimize") }) {
+                Icon(Icons.Default.Minimize, null, tint = titleColor)
+            }
+            IconButton(onClick = {
+                onWindowControl(
+                    controlledWindow.hwnd,
+                    if (controlledWindow.is_maximized) "restore" else "maximize"
+                )
+            }) {
+                Icon(
+                    if (controlledWindow.is_maximized) Icons.Default.CloseFullscreen else Icons.Default.OpenInFull,
+                    null,
+                    tint = titleColor
+                )
+            }
+            screens.forEach { screen ->
+                AssistChip(
+                    onClick = { onMoveWindowToScreen(controlledWindow.hwnd, screen) },
+                    label = { Text("Display ${screen.monitor_index}", maxLines = 1) },
+                    leadingIcon = { Icon(Icons.Default.StayCurrentLandscape, null, modifier = Modifier.size(18.dp)) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ShortcutBarContent(
+    inputMode: String,
+    titleColor: Color,
+    shortcuts: List<ShortcutConfig>,
+    onToggleInputMode: () -> Unit,
+    onKeyboard: () -> Unit,
+    onShortcut: (ShortcutConfig) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier.horizontalScroll(rememberScrollState())
+    ) {
+        FilterChip(
+            selected = inputMode == "touch",
+            onClick = onToggleInputMode,
+            label = { Text(if (inputMode == "touch") "Touch" else "Mouse") },
+            leadingIcon = {
+                Icon(
+                    if (inputMode == "touch") Icons.Default.TouchApp else Icons.Default.Mouse,
+                    null,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        )
+        IconButton(onClick = onKeyboard) {
+            Icon(Icons.Default.Keyboard, null, tint = titleColor)
+        }
+        shortcuts.forEach { shortcut ->
+            AssistChip(
+                onClick = { onShortcut(shortcut) },
+                label = { Text(shortcut.label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun NoRailOverscroll(content: @Composable () -> Unit) {
+    CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
+        content()
+    }
+}
+
+@Composable
+fun RailScrollableColumn(
+    modifier: Modifier = Modifier,
+    horizontalAlignment: Alignment.Horizontal = Alignment.Start,
+    verticalArrangement: Arrangement.Vertical = Arrangement.Top,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
+    NoRailOverscroll {
+        Column(
+            modifier = modifier
+                .pointerInput(scrollState) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val tracker = VelocityTracker()
+                        tracker.addPosition(down.uptimeMillis, down.position)
+                        val touchSlop = viewConfiguration.touchSlop
+                        var lastPosition = down.position
+                        var dragging = false
+
+                        do {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == down.id }
+                                ?: event.changes.firstOrNull()
+                                ?: break
+                            val delta = change.position - lastPosition
+                            tracker.addPosition(change.uptimeMillis, change.position)
+
+                            if (!dragging) {
+                                val total = change.position - down.position
+                                dragging = abs(total.x) > touchSlop || abs(total.y) > touchSlop
+                            }
+                            if (dragging) {
+                                val dominantDelta = if (abs(delta.x) > abs(delta.y)) delta.x else delta.y
+                                scrollState.dispatchRawDelta(-dominantDelta)
+                                change.consume()
+                            }
+                            lastPosition = change.position
+                        } while (event.changes.any { it.pressed })
+
+                        if (dragging) {
+                            val velocity = tracker.calculateVelocity()
+                            val dominantVelocity = if (abs(velocity.x) > abs(velocity.y)) velocity.x else velocity.y
+                            val flingDistance = (-dominantVelocity / 5.2f).coerceIn(-900f, 900f)
+                            if (abs(flingDistance) > 48f) {
+                                scope.launch {
+                                    scrollState.animateScrollBy(
+                                        value = flingDistance,
+                                        animationSpec = tween(durationMillis = 420)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                .verticalScroll(scrollState, enabled = false),
+            horizontalAlignment = horizontalAlignment,
+            verticalArrangement = verticalArrangement,
+            content = content
+        )
+    }
+}
+
+@Composable
+fun LandscapeRightControlRail(
+    windows: List<WindowInfo>,
+    currentWindow: WindowInfo?,
+    titleColor: Color,
+    accentColor: Color,
+    containerColor: Color,
+    containerAlpha: Float,
+    showTitles: Boolean,
+    rightPanelMode: String?,
+    screens: List<ScreenInfo>,
+    selectedScreenIndex: Int?,
+    showVirtualDisplayButton: Boolean,
+    extendedDisplayStatus: ExtendedDisplayStatus?,
+    extendedDisplayConnecting: Boolean,
+    onToggleMouseMode: () -> Unit,
+    onToggleScreenMode: () -> Unit,
+    onScreenSelected: (ScreenInfo) -> Unit,
+    onExtendDisplay: () -> Unit,
+    onMouseLeftClick: () -> Unit,
+    onMouseMiddleClick: () -> Unit,
+    onMouseRightClick: () -> Unit,
+    onMouseWheel: (Int) -> Unit,
+    onSwitchWindow: (Long) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(containerColor.copy(alpha = containerAlpha))
+            .padding(vertical = 8.dp, horizontal = 5.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(
+                onClick = onToggleMouseMode,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(CircleShape)
+                        .background(if (rightPanelMode == "mouse") accentColor.copy(alpha = 0.18f) else Color.Transparent),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Default.Mouse,
+                        contentDescription = "Mouse panel",
+                        tint = if (rightPanelMode == "mouse") accentColor else titleColor.copy(alpha = 0.78f),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.width(4.dp))
+            IconButton(
+                onClick = onToggleScreenMode,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(CircleShape)
+                        .background(if (rightPanelMode == "screen") accentColor.copy(alpha = 0.18f) else Color.Transparent),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Default.StayCurrentLandscape,
+                        contentDescription = "Screen panel",
+                        tint = if (rightPanelMode == "screen") accentColor else titleColor.copy(alpha = 0.78f),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            if (rightPanelMode == "mouse") {
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    FilledTonalButton(
+                        onClick = onMouseLeftClick,
+                        contentPadding = PaddingValues(horizontal = 4.dp),
+                        modifier = Modifier.fillMaxWidth().height(34.dp)
+                    ) { Text("Left", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+                    FilledTonalButton(
+                        onClick = onMouseMiddleClick,
+                        contentPadding = PaddingValues(horizontal = 4.dp),
+                        modifier = Modifier.fillMaxWidth().height(34.dp)
+                    ) { Text("Middle", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+                    FilledTonalButton(
+                        onClick = onMouseRightClick,
+                        contentPadding = PaddingValues(horizontal = 4.dp),
+                        modifier = Modifier.fillMaxWidth().height(34.dp)
+                    ) { Text("Right", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color.Black.copy(alpha = 0.12f))
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    val down = awaitFirstDown()
+                                    var prevY = down.position.y
+                                    do {
+                                        val event = awaitPointerEvent()
+                                        val change = event.changes.firstOrNull() ?: break
+                                        val dy = change.position.y - prevY
+                                        if (kotlin.math.abs(dy) > 6f) {
+                                            onMouseWheel(((-dy) * 1.2f).roundToInt().coerceIn(-120, 120))
+                                            prevY = change.position.y
+                                        }
+                                        change.consume()
+                                    } while (event.changes.any { it.pressed })
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("Wheel", fontSize = 10.sp, color = titleColor.copy(alpha = 0.8f))
+                    }
+                }
+            } else {
+                RailScrollableColumn(
+                    modifier = Modifier
+                        .fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (rightPanelMode == "screen") {
+                        val extendedMonitorIndex = extendedDisplayStatus?.monitor_index?.takeIf { it > 0 }
+                        val extendLabel = when {
+                            extendedDisplayConnecting -> "Preparing..."
+                            extendedMonitorIndex != null -> "Connected Display $extendedMonitorIndex"
+                            extendedDisplayStatus?.available == false && !extendedDisplayStatus.message.contains("status failed", ignoreCase = true) -> "Driver missing"
+                            extendedDisplayStatus?.bound_client_id?.isNotBlank() == true -> "Busy"
+                            else -> "Use Virtual Display"
+                        }
+                        if (showVirtualDisplayButton) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = accentColor.copy(alpha = 0.12f),
+                                border = BorderStroke(1.dp, accentColor.copy(alpha = 0.55f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable(enabled = !extendedDisplayConnecting) { onExtendDisplay() }
+                            ) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
+                                ) {
+                                    Icon(
+                                        if (extendedDisplayConnecting) Icons.Default.Sync else Icons.Default.Add,
+                                        null,
+                                        tint = accentColor,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Text(
+                                        extendLabel,
+                                        fontSize = 10.sp,
+                                        color = titleColor,
+                                        textAlign = TextAlign.Center,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                        if (screens.isEmpty()) {
+                            Text(
+                                "No screens",
+                                color = titleColor.copy(alpha = 0.58f),
+                                fontSize = 10.sp,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(top = 12.dp)
+                            )
+                        } else {
+                            screens.forEach { screen ->
+                                val selected = selectedScreenIndex == screen.monitor_index
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = if (selected) accentColor.copy(alpha = 0.18f) else Color.Transparent,
+                                    border = if (selected) BorderStroke(1.dp, accentColor) else null,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { onScreenSelected(screen) }
+                                ) {
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 7.dp)
+                                    ) {
+                                        if (selected) Icon(Icons.Default.Check, null, tint = accentColor, modifier = Modifier.size(14.dp))
+                                        Text(
+                                            "Display ${screen.monitor_index}",
+                                            color = titleColor,
+                                            fontSize = 10.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            textAlign = TextAlign.Center
+                                        )
+                                        Text(
+                                            "${screen.width}x${screen.height}",
+                                            color = titleColor.copy(alpha = 0.62f),
+                                            fontSize = 8.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            textAlign = TextAlign.Center
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        windows.forEach { window ->
+                            val isSelected = currentWindow?.hwnd == window.hwnd
+                            val bitmap = rememberIconBitmap(window.icon, window.hwnd)
+                            val border = if (isSelected) BorderStroke(2.dp, accentColor) else null
+
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                color = if (isSelected) accentColor.copy(alpha = 0.14f) else Color.Transparent,
+                                border = border,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onSwitchWindow(window.hwnd) }
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(vertical = 7.dp, horizontal = 4.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    IconContainer(bitmap, window.title, if (isSelected) 42.dp else 34.dp, accentColor, RoundedCornerShape(12.dp))
+                                    if (showTitles) {
+                                        Text(
+                                            text = window.title,
+                                            color = titleColor.copy(alpha = if (isSelected) 1f else 0.62f),
+                                            fontSize = 8.sp,
+                                            lineHeight = 8.sp,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                            textAlign = TextAlign.Center,
+                                            modifier = Modifier.padding(top = 3.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun FullscreenRailTextButton(
+    text: String,
+    titleColor: Color,
+    accentColor: Color,
+    icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
+    onClick: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = accentColor.copy(alpha = 0.12f),
+        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.30f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(44.dp)
+            .clickable { onClick() }
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 5.dp),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (icon != null) {
+                Icon(icon, null, tint = accentColor, modifier = Modifier.size(13.dp))
+                Spacer(Modifier.width(3.dp))
+            }
+            Text(
+                text = text,
+                color = titleColor,
+                fontSize = 9.sp,
+                lineHeight = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+@Composable
+fun BoxScope.FullscreenSideControlsOverlay(
+    enabled: Boolean,
+    panelOpen: Boolean,
+    onPanelOpenChange: (Boolean) -> Unit,
+    panelMode: String,
+    onPanelModeChange: (String) -> Unit,
+    showModeSwitch: Boolean,
+    showWindowControls: Boolean,
+    showShortcuts: Boolean,
+    rightPanelMode: String?,
+    windows: List<WindowInfo>,
+    showTitles: Boolean,
+    showVirtualDisplayButton: Boolean,
+    extendedDisplayStatus: ExtendedDisplayStatus?,
+    extendedDisplayConnecting: Boolean,
+    inputMode: String,
+    onToggleInputMode: () -> Unit,
+    onToggleMouseMode: () -> Unit,
+    onToggleScreenMode: () -> Unit,
+    shortcuts: List<ShortcutConfig>,
+    onShortcut: (ShortcutConfig) -> Unit,
+    onKeyboard: () -> Unit,
+    controlledWindow: WindowInfo?,
+    screens: List<ScreenInfo>,
+    selectedScreenIndex: Int?,
+    titleColor: Color,
+    accentColor: Color,
+    onWindowControl: (String) -> Unit,
+    onMoveWindowToScreen: (ScreenInfo) -> Unit,
+    onExtendDisplay: () -> Unit,
+    onSwitchWindow: (Long) -> Unit,
+    onScreenSelected: (ScreenInfo) -> Unit,
+    onFetchScreens: () -> Unit,
+    onMouseLeftClick: () -> Unit,
+    onMouseMiddleClick: () -> Unit,
+    onMouseRightClick: () -> Unit,
+    onMouseWheel: (Int) -> Unit
+) {
+    if (!enabled) return
+
+    val availableModes = remember(showModeSwitch, showWindowControls, showShortcuts) {
+        buildList {
+            if (showModeSwitch || showWindowControls) add("combo")
+            if (showWindowControls) add("window")
+            if (showShortcuts) add("shortcuts")
+        }
+    }
+    LaunchedEffect(availableModes, panelMode) {
+        if (availableModes.isNotEmpty() && panelMode !in availableModes) {
+            onPanelModeChange(availableModes.first())
+        }
+    }
+
+    BoxWithConstraints(modifier = Modifier.matchParentSize()) {
+        if (availableModes.isEmpty()) return@BoxWithConstraints
+
+        val panelWidth = when {
+            maxWidth >= 840.dp -> 340.dp
+            maxWidth >= 640.dp -> 300.dp
+            else -> 260.dp
+        }
+
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(start = 8.dp, top = 28.dp)
+                .width(48.dp),
+            shape = RoundedCornerShape(18.dp),
+            color = Color.Black.copy(alpha = 0.42f),
+            tonalElevation = 0.dp
+        ) {
+            Column(
+                modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                availableModes.forEach { mode ->
+                    val selected = panelOpen && panelMode == mode
+                    IconButton(
+                        onClick = {
+                            if (selected) {
+                                onPanelOpenChange(false)
+                            } else {
+                                onPanelModeChange(mode)
+                                onPanelOpenChange(true)
+                                if (mode == "window") {
+                                    onFetchScreens()
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .background(if (selected) accentColor.copy(alpha = 0.24f) else Color.Transparent)
+                    ) {
+                        Icon(
+                            when (mode) {
+                                "window" -> Icons.Default.OpenInNew
+                                "shortcuts" -> Icons.Default.KeyboardCommandKey
+                                else -> Icons.Default.TouchApp
+                            },
+                            null,
+                            tint = if (selected) accentColor else Color.White.copy(alpha = 0.88f),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        if (panelOpen && panelMode == "combo") {
+            LandscapeRightControlRail(
+                windows = windows,
+                currentWindow = controlledWindow,
+                titleColor = titleColor,
+                accentColor = accentColor,
+                containerColor = Color.Black,
+                containerAlpha = 0.52f,
+                showTitles = showTitles,
+                rightPanelMode = rightPanelMode,
+                screens = screens,
+                selectedScreenIndex = selectedScreenIndex,
+                showVirtualDisplayButton = showVirtualDisplayButton,
+                extendedDisplayStatus = extendedDisplayStatus,
+                extendedDisplayConnecting = extendedDisplayConnecting,
+                onToggleMouseMode = onToggleMouseMode,
+                onToggleScreenMode = onToggleScreenMode,
+                onScreenSelected = onScreenSelected,
+                onExtendDisplay = onExtendDisplay,
+                onMouseLeftClick = onMouseLeftClick,
+                onMouseMiddleClick = onMouseMiddleClick,
+                onMouseRightClick = onMouseRightClick,
+                onMouseWheel = onMouseWheel,
+                onSwitchWindow = onSwitchWindow,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 8.dp, top = 8.dp, bottom = 8.dp)
+                    .width(84.dp)
+                    .fillMaxHeight()
+            )
+        } else if (panelOpen) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 8.dp, top = 8.dp, bottom = 8.dp)
+                    .width(84.dp)
+                    .fillMaxHeight(),
+                shape = RoundedCornerShape(20.dp),
+                color = Color.Black.copy(alpha = 0.52f),
+                tonalElevation = 0.dp
+            ) {
+                RailScrollableColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(vertical = 8.dp, horizontal = 5.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    when (panelMode) {
+                        "shortcuts" -> {
+                            IconButton(
+                                onClick = onToggleInputMode,
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(28.dp)
+                                        .clip(CircleShape)
+                                        .background(accentColor.copy(alpha = 0.14f)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        if (inputMode == "touch") Icons.Default.TouchApp else Icons.Default.Mouse,
+                                        null,
+                                        tint = accentColor,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                            IconButton(
+                                onClick = onKeyboard,
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Icon(Icons.Default.Keyboard, null, tint = titleColor, modifier = Modifier.size(20.dp))
+                            }
+                            shortcuts.forEach { shortcut ->
+                                FullscreenRailTextButton(
+                                    text = shortcut.label,
+                                    titleColor = titleColor,
+                                    accentColor = accentColor,
+                                    onClick = { onShortcut(shortcut) }
+                                )
+                            }
+                        }
+                        "window" -> {
+                            if (controlledWindow == null) {
+                                FullscreenRailTextButton(
+                                    text = "No window",
+                                    titleColor = titleColor,
+                                    accentColor = accentColor,
+                                    onClick = {}
+                                )
+                            } else {
+                                IconButton(onClick = { onWindowControl("close") }, modifier = Modifier.size(36.dp)) {
+                                    Icon(Icons.Default.Close, null, tint = titleColor, modifier = Modifier.size(20.dp))
+                                }
+                                IconButton(onClick = { onWindowControl("minimize") }, modifier = Modifier.size(36.dp)) {
+                                    Icon(Icons.Default.Minimize, null, tint = titleColor, modifier = Modifier.size(20.dp))
+                                }
+                                IconButton(
+                                    onClick = { onWindowControl(if (controlledWindow.is_maximized) "restore" else "maximize") },
+                                    modifier = Modifier.size(36.dp)
+                                ) {
+                                    Icon(
+                                        if (controlledWindow.is_maximized) Icons.Default.CloseFullscreen else Icons.Default.OpenInFull,
+                                        null,
+                                        tint = titleColor,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                screens.forEach { screen ->
+                                    FullscreenRailTextButton(
+                                        text = "Display ${screen.monitor_index}",
+                                        titleColor = titleColor,
+                                        accentColor = accentColor,
+                                        icon = Icons.Default.StayCurrentLandscape,
+                                        onClick = { onMoveWindowToScreen(screen) },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun LandscapeSingleMode(
     windows: List<WindowInfo>,
     titleColor: Color,
@@ -1253,10 +2023,9 @@ fun LandscapeSingleMode(
                             }
                         }
                     } else {
-                        Column(
+                        RailScrollableColumn(
                             modifier = Modifier
-                                .fillMaxSize()
-                                .verticalScroll(rememberScrollState()),
+                                .fillMaxSize(),
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
