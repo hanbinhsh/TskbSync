@@ -1528,6 +1528,75 @@ def send_shortcut(keys):
         send_vk(vk, True)
     return bool(vks)
 
+
+def _start_menu_dirs():
+    dirs = []
+    appdata = os.environ.get("APPDATA")
+    programdata = os.environ.get("PROGRAMDATA")
+    if appdata:
+        dirs.append(Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+    if programdata:
+        dirs.append(Path(programdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+    return dirs
+
+def get_start_menu_apps():
+    apps = []
+    seen = set()
+    for root in _start_menu_dirs():
+        if not root.exists():
+            continue
+        try:
+            for item in root.rglob("*.lnk"):
+                try:
+                    path = str(item)
+                    key = path.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    apps.append({
+                        "label": item.stem,
+                        "path": path,
+                        "target": "",
+                    })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    apps.sort(key=lambda app: app.get("label", "").lower())
+    return apps
+
+def launch_start_menu_app(target: str):
+    value = str(target or "").strip().strip('"')
+    if not value:
+        return False, "target is empty"
+    path = Path(value).expanduser()
+    if not path.exists():
+        return False, "target not found"
+    try:
+        os.startfile(str(path))
+        return True, "launched"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+def run_custom_command(command: str):
+    value = str(command or "").strip()
+    if not value:
+        return False, "command is empty"
+    if len(value) > 2048:
+        return False, "command is too long"
+    try:
+        subprocess.Popen(
+            value,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return True, "started"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
 def send_unicode_text(text: str):
     for ch in text or "":
         code = ord(ch)
@@ -1856,6 +1925,12 @@ async def set_window_filter(request: Request):
                 pass
     return WINDOW_FILTER_CONFIG
 
+@app.get("/start-menu/apps")
+async def start_menu_apps_endpoint(request: Request):
+    if request.headers.get("password") != PASSWORD:
+        return JSONResponse(status_code=401, content={"message": "Invalid password"})
+    return get_start_menu_apps()
+
 @app.get("/screens")
 async def screens_endpoint():
     return get_screens_list()
@@ -2120,6 +2195,18 @@ async def input_endpoint(websocket: WebSocket, hwnd: int):
                     print(f"[input] shortcut hwnd={hwnd} keys={data.get('keys', [])!r}", flush=True)
                     focus_window(hwnd, aggressive=True)
                     send_shortcut(data.get("keys", []))
+                elif event_type == "launch_start_menu_app":
+                    target = data.get("target", "")
+                    print(f"[input] launch_start_menu_app target={str(target)[:120]!r}", flush=True)
+                    ok, message = launch_start_menu_app(target)
+                    if not ok:
+                        await websocket.send_text(json.dumps({"type": "error", "message": message}))
+                elif event_type == "run_command":
+                    command = data.get("command", "")
+                    print(f"[input] run_command chars={len(str(command))}", flush=True)
+                    ok, message = run_custom_command(command)
+                    if not ok:
+                        await websocket.send_text(json.dumps({"type": "error", "message": message}))
                 else:
                     await websocket.send_text(json.dumps({"type": "error", "message": f"unknown input type: {event_type}"}))
             except Exception as e:
@@ -2164,6 +2251,14 @@ async def input_screen_endpoint(websocket: WebSocket, monitor_index: int):
                     send_key_name(data.get("key", ""))
                 elif event_type == "shortcut":
                     send_shortcut(data.get("keys", []))
+                elif event_type == "launch_start_menu_app":
+                    ok, message = launch_start_menu_app(data.get("target", ""))
+                    if not ok:
+                        await websocket.send_text(json.dumps({"type": "error", "message": message}))
+                elif event_type == "run_command":
+                    ok, message = run_custom_command(data.get("command", ""))
+                    if not ok:
+                        await websocket.send_text(json.dumps({"type": "error", "message": message}))
                 else:
                     await websocket.send_text(json.dumps({"type": "error", "message": f"unknown input type: {event_type}"}))
             except Exception as e:

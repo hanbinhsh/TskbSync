@@ -48,6 +48,13 @@ import kotlin.math.roundToLong
 
 data class H264VideoConfig(val width: Int, val height: Int, val fps: Int = 60)
 
+@kotlinx.serialization.Serializable
+data class StartMenuAppInfo(
+    val label: String,
+    val path: String,
+    val target: String = ""
+)
+
 data class TouchPointInput(
     val id: Int,
     val action: String,
@@ -128,6 +135,11 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     val h264Status: State<H264StatusInfo?> = _h264Status
     private val _audioStatus = mutableStateOf<String?>(null)
     val audioStatus: State<String?> = _audioStatus
+
+    private val _startMenuApps = mutableStateOf<List<StartMenuAppInfo>>(emptyList())
+    val startMenuApps: State<List<StartMenuAppInfo>> = _startMenuApps
+    private val _startMenuAppsLoading = mutableStateOf(false)
+    val startMenuAppsLoading: State<Boolean> = _startMenuAppsLoading
     private val _h264Frames = MutableSharedFlow<ByteArray>(extraBufferCapacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     val h264Frames: SharedFlow<ByteArray> = _h264Frames
 
@@ -815,11 +827,40 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
 
     fun sendShortcut(shortcut: ShortcutConfig) {
         sendRemoteInput(buildJsonObject {
-            put("type", "shortcut")
-            putJsonArray("keys") {
-                shortcut.keys.forEach { add(it) }
+            when (shortcut.type) {
+                ShortcutActionType.KEYS -> {
+                    put("type", "shortcut")
+                    putJsonArray("keys") {
+                        shortcut.keys.forEach { add(it) }
+                    }
+                }
+                ShortcutActionType.START_MENU_APP -> {
+                    put("type", "launch_start_menu_app")
+                    put("target", shortcut.target)
+                }
+                ShortcutActionType.COMMAND -> {
+                    put("type", "run_command")
+                    put("command", shortcut.target)
+                }
             }
         })
+    }
+
+    fun fetchStartMenuApps() {
+        viewModelScope.launch {
+            val ip = _pcIp.value
+            if (ip.isEmpty()) return@launch
+            _startMenuAppsLoading.value = true
+            try {
+                _startMenuApps.value = client.get("http://$ip:8000/start-menu/apps") {
+                    header("password", _password.value)
+                }.body()
+            } catch (e: Exception) {
+                _error.value = "Start menu apps fetch failed: ${e.message ?: e::class.java.simpleName}"
+            } finally {
+                _startMenuAppsLoading.value = false
+            }
+        }
     }
 
     fun saveShortcuts(shortcuts: List<ShortcutConfig>) {
