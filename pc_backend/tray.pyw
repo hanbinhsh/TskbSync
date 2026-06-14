@@ -15,6 +15,9 @@ APP_NAME = "TskbSync Backend"
 AUTOSTART_NAME = "TskbSyncBackendTray"
 WM_TRAYICON = win32con.WM_USER + 20
 TRAY_UID = 1
+TRAY_RETRY_TIMER_ID = 10
+TRAY_RETRY_INTERVAL_MS = 3000
+TASKBAR_CREATED = win32gui.RegisterWindowMessage("TaskbarCreated")
 
 MENU_OPEN_LOGS = 1001
 MENU_RESTART = 1002
@@ -43,6 +46,7 @@ class BackendTray:
     def __init__(self):
         self.hwnd = None
         self.icon = None
+        self.icon_added = False
         self.process = None
         self.log_file = None
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -50,8 +54,9 @@ class BackendTray:
     def run(self):
         tray_log("tray starting")
         self._create_window()
-        self._add_tray_icon()
         self.start_service()
+        if not self._add_tray_icon():
+            self._schedule_tray_retry()
         win32gui.PumpMessages()
 
     def _create_window(self):
@@ -59,7 +64,9 @@ class BackendTray:
             win32con.WM_CLOSE: self.on_close,
             win32con.WM_DESTROY: self.on_destroy,
             win32con.WM_COMMAND: self.on_command,
+            win32con.WM_TIMER: self.on_timer,
             WM_TRAYICON: self.on_tray_event,
+            TASKBAR_CREATED: self.on_taskbar_created,
         }
         wc = win32gui.WNDCLASS()
         wc.hInstance = win32api.GetModuleHandle(None)
@@ -93,22 +100,49 @@ class BackendTray:
         return win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
 
     def _add_tray_icon(self):
+        if self.icon_added:
+            return True
         self.icon = self._load_icon()
         flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
         nid = (self.hwnd, TRAY_UID, flags, WM_TRAYICON, self.icon, APP_NAME)
         try:
             win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
+            self.icon_added = True
+            self._cancel_tray_retry()
             tray_log("tray icon added")
+            return True
         except Exception:
-            fallback_icon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
-            fallback_nid = (self.hwnd, TRAY_UID, flags, WM_TRAYICON, fallback_icon, APP_NAME)
-            win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, fallback_nid)
-            self.icon = fallback_icon
-            tray_log("tray icon added with fallback icon")
+            try:
+                fallback_icon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+                fallback_nid = (self.hwnd, TRAY_UID, flags, WM_TRAYICON, fallback_icon, APP_NAME)
+                win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, fallback_nid)
+                self.icon = fallback_icon
+                self.icon_added = True
+                self._cancel_tray_retry()
+                tray_log("tray icon added with fallback icon")
+                return True
+            except Exception as e:
+                tray_log(f"tray icon add failed; will retry: {e}")
+                return False
 
     def _remove_tray_icon(self):
+        if not self.icon_added:
+            return
         try:
             win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (self.hwnd, TRAY_UID))
+        except Exception:
+            pass
+        self.icon_added = False
+
+    def _schedule_tray_retry(self):
+        try:
+            win32gui.SetTimer(self.hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_INTERVAL_MS, None)
+        except Exception as e:
+            tray_log(f"tray retry timer failed: {e}")
+
+    def _cancel_tray_retry(self):
+        try:
+            win32gui.KillTimer(self.hwnd, TRAY_RETRY_TIMER_ID)
         except Exception:
             pass
 
@@ -248,7 +282,14 @@ class BackendTray:
         )
 
     def _autostart_command(self):
-        return f'"{self._python_windowless_exe()}" "{os.path.abspath(__file__)}"'
+        base_dir = BASE_DIR.replace("'", "''")
+        python_exe = self._python_windowless_exe().replace("'", "''")
+        tray_script = os.path.abspath(__file__).replace("'", "''")
+        command = f"Set-Location -LiteralPath '{base_dir}'; & '{python_exe}' '{tray_script}'"
+        return (
+            'powershell.exe -NoProfile -ExecutionPolicy Bypass '
+            f'-WindowStyle Hidden -Command "{command}"'
+        )
 
     def _cleanup_legacy_autostart(self):
         run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -345,6 +386,17 @@ class BackendTray:
             self.show_menu()
         return True
 
+    def on_timer(self, hwnd, msg, wparam, lparam):
+        if wparam == TRAY_RETRY_TIMER_ID:
+            self._add_tray_icon()
+        return True
+
+    def on_taskbar_created(self, hwnd, msg, wparam, lparam):
+        self.icon_added = False
+        if not self._add_tray_icon():
+            self._schedule_tray_retry()
+        return True
+
     def on_command(self, hwnd, msg, wparam, lparam):
         self.handle_command(win32api.LOWORD(wparam))
         return True
@@ -365,6 +417,7 @@ class BackendTray:
         return True
 
     def on_destroy(self, hwnd, msg, wparam, lparam):
+        self._cancel_tray_retry()
         self.stop_service()
         self._remove_tray_icon()
         win32gui.PostQuitMessage(0)
