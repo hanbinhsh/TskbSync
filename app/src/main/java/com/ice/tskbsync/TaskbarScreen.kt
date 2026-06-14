@@ -1047,10 +1047,17 @@ fun ShortcutBarContent(
         shortcuts.forEach { shortcut ->
             AssistChip(
                 onClick = { onShortcut(shortcut) },
-                label = { Text(shortcut.label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                label = { Text(shortcutDisplayLabel(shortcut), maxLines = 1, overflow = TextOverflow.Ellipsis) }
             )
         }
     }
+}
+
+
+private fun shortcutDisplayLabel(shortcut: ShortcutConfig): String = when (shortcut.type) {
+    ShortcutActionType.KEYS -> shortcut.label
+    ShortcutActionType.START_MENU_APP -> "▶ ${shortcut.label}"
+    ShortcutActionType.COMMAND -> "> ${shortcut.label}"
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -1619,7 +1626,7 @@ fun BoxScope.FullscreenSideControlsOverlay(
                             }
                             shortcuts.forEach { shortcut ->
                                 FullscreenRailTextButton(
-                                    text = shortcut.label,
+                                    text = shortcutDisplayLabel(shortcut),
                                     titleColor = titleColor,
                                     accentColor = accentColor,
                                     onClick = { onShortcut(shortcut) }

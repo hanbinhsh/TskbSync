@@ -37,6 +37,8 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val gridCols by viewModel.gridColumns
     val showTitles by viewModel.showTitles
     val shortcuts by viewModel.shortcuts
+    val startMenuApps by viewModel.startMenuApps
+    val startMenuAppsLoading by viewModel.startMenuAppsLoading
     val windowFilter by viewModel.windowFilter
     val h264Status by viewModel.h264Status
     val audioStatus by viewModel.audioStatus
@@ -369,8 +371,8 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                 shortcuts.forEachIndexed { index, shortcut ->
                                     ListItem(
                                         headlineContent = { Text(shortcut.label) },
-                                        supportingContent = { Text(shortcut.keys.joinToString(" + ")) },
-                                        leadingContent = { Icon(Icons.Default.KeyboardCommandKey, null) },
+                                        supportingContent = { Text(shortcut.description()) },
+                                        leadingContent = { Icon(shortcutIcon(shortcut.type), null) },
                                         trailingContent = {
                                             Row {
                                                 IconButton(onClick = { editingShortcutIndex = index }) {
@@ -392,7 +394,10 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
                                     OutlinedButton(
-                                        onClick = { editingShortcutIndex = shortcuts.size },
+                                        onClick = {
+                                            viewModel.fetchStartMenuApps()
+                                            editingShortcutIndex = shortcuts.size
+                                        },
                                         modifier = Modifier.weight(1f)
                                     ) {
                                         Icon(Icons.Default.Add, null)
@@ -563,6 +568,9 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
         val existing = shortcuts.getOrNull(index)
         ShortcutEditDialog(
             shortcut = existing,
+            startMenuApps = startMenuApps,
+            startMenuAppsLoading = startMenuAppsLoading,
+            onRefreshStartMenuApps = { viewModel.fetchStartMenuApps() },
             onDismiss = { editingShortcutIndex = null },
             onSave = { shortcut ->
                 val next = shortcuts.toMutableList()
@@ -792,14 +800,27 @@ fun H264StatusPanel(
 private fun parseRuleLines(text: String): List<String> =
     text.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
 
+private fun shortcutIcon(type: ShortcutActionType) = when (type) {
+    ShortcutActionType.KEYS -> Icons.Default.KeyboardCommandKey
+    ShortcutActionType.START_MENU_APP -> Icons.Default.Apps
+    ShortcutActionType.COMMAND -> Icons.Default.Terminal
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ShortcutEditDialog(
     shortcut: ShortcutConfig?,
+    startMenuApps: List<StartMenuAppInfo>,
+    startMenuAppsLoading: Boolean,
+    onRefreshStartMenuApps: () -> Unit,
     onDismiss: () -> Unit,
     onSave: (ShortcutConfig) -> Unit
 ) {
     var label by remember(shortcut) { mutableStateOf(shortcut?.label ?: "") }
     var keysText by remember(shortcut) { mutableStateOf(shortcut?.keys?.joinToString("+") ?: "") }
+    var actionType by remember(shortcut) { mutableStateOf(shortcut?.type ?: ShortcutActionType.KEYS) }
+    var target by remember(shortcut) { mutableStateOf(shortcut?.target ?: "") }
+    var appMenuExpanded by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -813,13 +834,79 @@ fun ShortcutEditDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                OutlinedTextField(
-                    value = keysText,
-                    onValueChange = { keysText = it.uppercase() },
-                    label = { Text("Keys, e.g. CTRL+V") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    listOf(
+                        ShortcutActionType.KEYS to "Keys",
+                        ShortcutActionType.START_MENU_APP to "Start",
+                        ShortcutActionType.COMMAND to "Command"
+                    ).forEachIndexed { index, item ->
+                        SegmentedButton(
+                            selected = actionType == item.first,
+                            onClick = { actionType = item.first },
+                            shape = SegmentedButtonDefaults.itemShape(index, 3),
+                            label = { Text(item.second) }
+                        )
+                    }
+                }
+                when (actionType) {
+                    ShortcutActionType.KEYS -> OutlinedTextField(
+                        value = keysText,
+                        onValueChange = { keysText = it.uppercase() },
+                        label = { Text("Keys, e.g. CTRL+V") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    ShortcutActionType.START_MENU_APP -> {
+                        Box {
+                            OutlinedTextField(
+                                value = target,
+                                onValueChange = { target = it },
+                                label = { Text("Start menu program") },
+                                supportingText = { Text("Choose a discovered .lnk or paste a program/shortcut path") },
+                                trailingIcon = {
+                                    Row {
+                                        IconButton(onClick = onRefreshStartMenuApps) {
+                                            Icon(Icons.Default.Refresh, null)
+                                        }
+                                        IconButton(onClick = { appMenuExpanded = true }) {
+                                            Icon(Icons.Default.ArrowDropDown, null)
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            DropdownMenu(
+                                expanded = appMenuExpanded,
+                                onDismissRequest = { appMenuExpanded = false }
+                            ) {
+                                if (startMenuAppsLoading) {
+                                    DropdownMenuItem(text = { Text("Loading...") }, onClick = {})
+                                } else if (startMenuApps.isEmpty()) {
+                                    DropdownMenuItem(text = { Text("No programs found. Refresh or paste a path.") }, onClick = {})
+                                } else {
+                                    startMenuApps.take(80).forEach { app ->
+                                        DropdownMenuItem(
+                                            text = { Text(app.label) },
+                                            onClick = {
+                                                label = label.ifBlank { app.label }
+                                                target = app.path
+                                                appMenuExpanded = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ShortcutActionType.COMMAND -> OutlinedTextField(
+                        value = target,
+                        onValueChange = { target = it },
+                        label = { Text("Command") },
+                        supportingText = { Text("Runs on the PC. Only add commands you trust.") },
+                        minLines = 2,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
         },
         confirmButton = {
@@ -828,8 +915,20 @@ fun ShortcutEditDialog(
                     val keys = keysText.split("+", ",", " ")
                         .map { it.trim() }
                         .filter { it.isNotEmpty() }
-                    if (label.isNotBlank() && keys.isNotEmpty()) {
-                        onSave(ShortcutConfig(label.trim(), keys))
+                    val cleanTarget = target.trim()
+                    val canSave = label.isNotBlank() && when (actionType) {
+                        ShortcutActionType.KEYS -> keys.isNotEmpty()
+                        ShortcutActionType.START_MENU_APP, ShortcutActionType.COMMAND -> cleanTarget.isNotEmpty()
+                    }
+                    if (canSave) {
+                        onSave(
+                            ShortcutConfig(
+                                label = label.trim(),
+                                keys = if (actionType == ShortcutActionType.KEYS) keys else emptyList(),
+                                type = actionType,
+                                target = if (actionType == ShortcutActionType.KEYS) "" else cleanTarget
+                            )
+                        )
                     }
                 }
             ) { Text("Save") }
