@@ -884,7 +884,7 @@ fun ShortcutEditDialog(
                                 } else if (startMenuApps.isEmpty()) {
                                     DropdownMenuItem(text = { Text("No programs found. Refresh or paste a path.") }, onClick = {})
                                 } else {
-                                    startMenuApps.take(80).forEach { app ->
+                                    startMenuApps.forEach { app ->  // .take(80)
                                         DropdownMenuItem(
                                             text = { Text(app.label) },
                                             onClick = {
