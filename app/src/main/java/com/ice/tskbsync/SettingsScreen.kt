@@ -96,6 +96,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
             val tabs = listOf(
                 "Connection",
                 "Layout",
+                "Control",
                 "Streaming",
                 "Fullscreen",
                 "Audio",
@@ -198,6 +199,24 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                         }
 
                         2 -> item {
+                            SectionTitle("Control", themeColor)
+                            SettingsSection(
+                                "Mouse",
+                                subtitle = "Touchpad pointer speed in Mouse mode"
+                            ) {
+                                SettingsFloatSliderRow(
+                                    "Mouse Sensitivity",
+                                    theme.mouseSensitivity,
+                                    "x",
+                                    0.1f..4.0f,
+                                    38
+                                ) {
+                                    viewModel.updateTheme(theme.copy(mouseSensitivity = it))
+                                }
+                            }
+                        }
+
+                        3 -> item {
                             SectionTitle("Streaming", themeColor)
                             SettingsSection("Video") {
                                 SettingsSliderRow("Stream Resolution", theme.streamMaxDim, "p", 360f..3840f, 28) {
@@ -234,7 +253,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        3 -> item {
+                        4 -> item {
                             SectionTitle("Fullscreen", themeColor)
                             SettingsSection("Side Controls") {
                                 SettingsSwitchRow(
@@ -270,7 +289,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        4 -> item {
+                        5 -> item {
                             SectionTitle("Audio", themeColor)
                             SettingsSection("Playback") {
                                 SettingsSwitchRow(
@@ -288,7 +307,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        5 -> item {
+                        6 -> item {
                             SectionTitle("Virtual Display", themeColor)
                             SettingsSection("Entry") {
                                 SettingsSwitchRow(
@@ -318,7 +337,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        6 -> item {
+                        7 -> item {
                             SectionTitle("Appearance", themeColor)
                             SettingsSection("Colors") {
                                 ColorListItem("Theme Accent", Color(theme.color)) { colorPickerMode = "accent"; showColorDialog = true }
@@ -365,7 +384,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        7 -> item {
+                        8 -> item {
                             SectionTitle("Shortcuts", themeColor)
                             SettingsSection("Commands") {
                                 shortcuts.forEachIndexed { index, shortcut ->
@@ -416,7 +435,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                             }
                         }
 
-                        8 -> item {
+                        9 -> item {
                             SectionTitle("Advanced", themeColor)
                             SettingsSection("Hardware Encoder Diagnostics") {
                                 H264StatusPanel(
@@ -655,6 +674,29 @@ fun SettingsSliderRow(
         Slider(
             value = value.toFloat(),
             onValueChange = { onValueChange(it.roundToInt()) },
+            valueRange = range,
+            steps = steps
+        )
+    }
+}
+
+@Composable
+fun SettingsFloatSliderRow(
+    label: String,
+    value: Float,
+    suffix: String,
+    range: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    onValueChange: (Float) -> Unit
+) {
+    Column(Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) {
+        Text(
+            "$label: ${"%.1f".format(value)}$suffix",
+            style = MaterialTheme.typography.bodySmall
+        )
+        Slider(
+            value = value,
+            onValueChange = { onValueChange((it * 10).roundToInt() / 10f) },
             valueRange = range,
             steps = steps
         )

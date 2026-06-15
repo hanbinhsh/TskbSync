@@ -109,7 +109,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _password = mutableStateOf("")
     val password: State<String> = _password
 
-    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, false, 0, 60, true, true, 0xFF202124.toInt(), 0.87f, 56, true, 2000, false, 18, true, true, true, true, false))
+    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, false, 0, 60, true, true, 0xFF202124.toInt(), 0.87f, 56, true, 2000, false, 18, true, true, true, true, false, 1.8f))
     val theme: State<ThemeSettings> = _theme
 
     private val _layoutMode = mutableStateOf("grid")
@@ -728,12 +728,29 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun sendMouseInput(action: String, x: Float, y: Float) {
+    fun sendMouseInput(action: String, a: Float, b: Float) {
         sendRemoteInput(buildJsonObject {
             put("type", "mouse")
-            put("action", action)
-            put("x", x.coerceIn(0f, 1f))
-            put("y", y.coerceIn(0f, 1f))
+            when (action) {
+                // Touchpad-style relative move: a/b carry the pixel delta (dx/dy).
+                "move_rel" -> {
+                    put("action", "move_rel")
+                    put("dx", a)
+                    put("dy", b)
+                }
+                // Tap-to-click: click at the current cursor position (no repositioning).
+                "click" -> {
+                    put("action", "click")
+                    put("button", "left")
+                    put("relative", true)
+                }
+                // Legacy absolute positioning (unused by touchpad mode, kept for safety).
+                else -> {
+                    put("action", action)
+                    put("x", a.coerceIn(0f, 1f))
+                    put("y", b.coerceIn(0f, 1f))
+                }
+            }
         })
     }
 
@@ -742,8 +759,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             put("type", "mouse")
             put("action", "click")
             put("button", button)
-            put("x", 0.5f)
-            put("y", 0.5f)
+            put("relative", true)
         })
     }
 
@@ -752,8 +768,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             put("type", "mouse")
             put("action", "wheel")
             put("delta", delta)
-            put("x", 0.5f)
-            put("y", 0.5f)
+            put("relative", true)
         })
     }
 

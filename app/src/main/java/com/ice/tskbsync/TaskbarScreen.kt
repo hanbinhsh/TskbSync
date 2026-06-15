@@ -402,6 +402,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     h264Frames = viewModel.h264Frames,
                                     showExitHint = showFullscreenExitHint,
                                     inputMode = landscapeInputMode,
+                                    mouseSensitivity = theme.mouseSensitivity,
                                     onMouseInput = { action, x, y -> viewModel.sendMouseInput(action, x, y) },
                                     onTouchInput = { action, x, y -> viewModel.sendTouchInput(action, x, y) },
                                     onMultiTouchInput = { points -> viewModel.sendMultiTouchInput(points) }
@@ -573,6 +574,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                         if (selectedScreenIndex == null) viewModel.startRemoteInput(it)
                                     },
                                     onStopInput = { viewModel.stopRemoteInput() },
+                                    mouseSensitivity = theme.mouseSensitivity,
                                     onMouseInput = { action, x, y -> viewModel.sendMouseInput(action, x, y) },
                                     onTouchInput = { action, x, y -> viewModel.sendTouchInput(action, x, y) },
                                     onMultiTouchInput = { points -> viewModel.sendMultiTouchInput(points) },
@@ -687,6 +689,7 @@ fun FullscreenWindowPreview(
     h264Frames: SharedFlow<ByteArray>,
     showExitHint: Boolean,
     inputMode: String,
+    mouseSensitivity: Float,
     onMouseInput: (String, Float, Float) -> Unit,
     onTouchInput: (String, Float, Float) -> Unit,
     onMultiTouchInput: (List<TouchPointInput>) -> Unit
@@ -724,6 +727,11 @@ fun FullscreenWindowPreview(
                     var lastY = startY
                     var moved = false
                     var lastTouchSentAt = 0L
+                    // Touchpad-style relative tracking (raw pixels) for mouse mode.
+                    var lastRawX = down.position.x
+                    var lastRawY = down.position.y
+                    var accDx = 0f
+                    var accDy = 0f
                     if (inputMode == "touch") {
                         onMultiTouchInput(
                             listOf(
@@ -737,9 +745,8 @@ fun FullscreenWindowPreview(
                             )
                         )
                         lastTouchSentAt = android.os.SystemClock.uptimeMillis()
-                    } else {
-                        onMouseInput("move", startX, startY)
                     }
+                    // Mouse mode: do NOT reposition the cursor on touch-down (touchpad behavior).
 
                     do {
                         val event = awaitPointerEvent()
@@ -771,8 +778,18 @@ fun FullscreenWindowPreview(
                                 lastTouchSentAt = now
                             }
                         } else {
-                            if (abs(x - lastX) > 0.002f || abs(y - lastY) > 0.002f) {
-                                onMouseInput("move", x, y)
+                            // Accumulate scaled pixel delta; keep the sub-pixel remainder
+                            // so slow drags aren't lost to integer rounding.
+                            accDx += (change.position.x - lastRawX) * mouseSensitivity
+                            accDy += (change.position.y - lastRawY) * mouseSensitivity
+                            lastRawX = change.position.x
+                            lastRawY = change.position.y
+                            val sendDx = accDx.toInt()
+                            val sendDy = accDy.toInt()
+                            if (sendDx != 0 || sendDy != 0) {
+                                onMouseInput("move_rel", sendDx.toFloat(), sendDy.toFloat())
+                                accDx -= sendDx
+                                accDy -= sendDy
                             }
                         }
                         lastX = x
@@ -1715,6 +1732,7 @@ fun LandscapeSingleMode(
     onRowPageChange: (Long) -> Unit,
     onStartInput: (Long) -> Unit,
     onStopInput: () -> Unit,
+    mouseSensitivity: Float,
     onMouseInput: (String, Float, Float) -> Unit,
     onTouchInput: (String, Float, Float) -> Unit,
     onMultiTouchInput: (List<TouchPointInput>) -> Unit,
@@ -1800,6 +1818,11 @@ fun LandscapeSingleMode(
                                         var lastY = startY
                                         var moved = false
                                         var lastTouchSentAt = 0L
+                                        // Touchpad-style relative tracking (raw pixels) for mouse mode.
+                                        var lastRawX = down.position.x
+                                        var lastRawY = down.position.y
+                                        var accDx = 0f
+                                        var accDy = 0f
                                         if (inputMode == "touch") {
                                             onMultiTouchInput(
                                                 listOf(
@@ -1813,9 +1836,8 @@ fun LandscapeSingleMode(
                                                 )
                                             )
                                             lastTouchSentAt = android.os.SystemClock.uptimeMillis()
-                                        } else {
-                                            onMouseInput("move", startX, startY)
                                         }
+                                        // Mouse mode: do NOT reposition the cursor on touch-down (touchpad behavior).
 
                                         do {
                                             val event = awaitPointerEvent()
@@ -1847,13 +1869,21 @@ fun LandscapeSingleMode(
                                                     lastTouchSentAt = now
                                                 }
                                             } else if (change.pressed) {
-                                                onMouseInput("move", x, y)
-                                            } else {
-                                                if (!moved) {
-                                                    onMouseInput("click", x, y)
-                                                } else {
-                                                    onMouseInput("move", x, y)
+                                                // Accumulate scaled pixel delta; keep the sub-pixel remainder
+                                                // so slow drags aren't lost to integer rounding.
+                                                accDx += (change.position.x - lastRawX) * mouseSensitivity
+                                                accDy += (change.position.y - lastRawY) * mouseSensitivity
+                                                lastRawX = change.position.x
+                                                lastRawY = change.position.y
+                                                val sendDx = accDx.toInt()
+                                                val sendDy = accDy.toInt()
+                                                if (sendDx != 0 || sendDy != 0) {
+                                                    onMouseInput("move_rel", sendDx.toFloat(), sendDy.toFloat())
+                                                    accDx -= sendDx
+                                                    accDy -= sendDy
                                                 }
+                                            } else if (!moved) {
+                                                onMouseInput("click", startX, startY)
                                             }
                                             lastX = x
                                             lastY = y

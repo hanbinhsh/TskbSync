@@ -1614,23 +1614,20 @@ def send_unicode_text(text: str):
         if sent != 2:
             raise RuntimeError(f"SendInput unicode failed: sent={sent} error={ctypes.get_last_error()} size={ctypes.sizeof(INPUT)}")
 
-def handle_mouse_input(hwnd: int, data: dict):
-    action = data.get("action", "move")
-    sx, sy = get_window_screen_point(hwnd, data.get("x", 0.0), data.get("y", 0.0))
-    if action in ("down", "click"):
-        focus_window(hwnd, aggressive=True)
-    handle_mouse_at_point(sx, sy, data)
+def is_relative_mouse(data: dict) -> bool:
+    return data.get("action") == "move_rel" or bool(data.get("relative"))
 
-def handle_mouse_at_point(sx: int, sy: int, data: dict):
-    action = data.get("action", "move")
-    user32.SetCursorPos(sx, sy)
+def get_mouse_button_flags(data: dict):
     button = data.get("button", "left")
     if button == "right":
-        down_flag, up_flag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
+        return MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
     elif button == "middle":
-        down_flag, up_flag = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
-    else:
-        down_flag, up_flag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
+        return MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
+    return MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
+
+def apply_mouse_buttons(data: dict):
+    action = data.get("action", "move")
+    down_flag, up_flag = get_mouse_button_flags(data)
     if action == "down":
         user32.mouse_event(down_flag, 0, 0, 0, 0)
     elif action == "up":
@@ -1641,7 +1638,36 @@ def handle_mouse_at_point(sx: int, sy: int, data: dict):
     elif action == "wheel":
         user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, int(data.get("delta", 0)), 0)
 
+def handle_mouse_relative(data: dict):
+    # Touchpad-style: move the cursor by a delta from its current position,
+    # and perform clicks/wheel wherever the cursor already is (no repositioning).
+    action = data.get("action", "move")
+    if action == "move_rel":
+        dx = int(round(data.get("dx", 0.0)))
+        dy = int(round(data.get("dy", 0.0)))
+        if dx != 0 or dy != 0:
+            user32.mouse_event(MOUSEEVENTF_MOVE, dx, dy, 0, 0)
+        return
+    apply_mouse_buttons(data)
+
+def handle_mouse_input(hwnd: int, data: dict):
+    if is_relative_mouse(data):
+        handle_mouse_relative(data)
+        return
+    action = data.get("action", "move")
+    sx, sy = get_window_screen_point(hwnd, data.get("x", 0.0), data.get("y", 0.0))
+    if action in ("down", "click"):
+        focus_window(hwnd, aggressive=True)
+    handle_mouse_at_point(sx, sy, data)
+
+def handle_mouse_at_point(sx: int, sy: int, data: dict):
+    user32.SetCursorPos(sx, sy)
+    apply_mouse_buttons(data)
+
 def handle_mouse_screen_input(monitor_index: int, data: dict):
+    if is_relative_mouse(data):
+        handle_mouse_relative(data)
+        return
     sx, sy = get_screen_point(monitor_index, data.get("x", 0.5), data.get("y", 0.5))
     handle_mouse_at_point(sx, sy, data)
 

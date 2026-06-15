@@ -59,7 +59,8 @@ data class ThemeSettings(
     val fullscreenShowModeSwitch: Boolean,
     val fullscreenShowWindowControls: Boolean,
     val fullscreenShowShortcuts: Boolean,
-    val fullscreenRememberPanelOpen: Boolean
+    val fullscreenRememberPanelOpen: Boolean,
+    val mouseSensitivity: Float
 )
 
 class SettingsManager(private val context: Context) {
@@ -103,6 +104,7 @@ class SettingsManager(private val context: Context) {
         private val FULLSCREEN_SHOW_WINDOW_CONTROLS_KEY = booleanPreferencesKey("fullscreen_show_window_controls")
         private val FULLSCREEN_SHOW_SHORTCUTS_KEY = booleanPreferencesKey("fullscreen_show_shortcuts")
         private val FULLSCREEN_REMEMBER_PANEL_OPEN_KEY = booleanPreferencesKey("fullscreen_remember_panel_open")
+        private val MOUSE_SENSITIVITY_KEY = floatPreferencesKey("mouse_sensitivity")
         private val WINDOW_FILTER_KEY = stringPreferencesKey("window_filter")
         private val SHORTCUTS_KEY = stringPreferencesKey("shortcuts")
     }
@@ -172,7 +174,8 @@ class SettingsManager(private val context: Context) {
             fullscreenShowModeSwitch = pref[FULLSCREEN_SHOW_MODE_SWITCH_KEY] ?: true,
             fullscreenShowWindowControls = pref[FULLSCREEN_SHOW_WINDOW_CONTROLS_KEY] ?: true,
             fullscreenShowShortcuts = pref[FULLSCREEN_SHOW_SHORTCUTS_KEY] ?: true,
-            fullscreenRememberPanelOpen = pref[FULLSCREEN_REMEMBER_PANEL_OPEN_KEY] ?: false
+            fullscreenRememberPanelOpen = pref[FULLSCREEN_REMEMBER_PANEL_OPEN_KEY] ?: false,
+            mouseSensitivity = pref[MOUSE_SENSITIVITY_KEY] ?: 1.8f
         )
     }
 
@@ -225,6 +228,7 @@ class SettingsManager(private val context: Context) {
             pref[FULLSCREEN_SHOW_WINDOW_CONTROLS_KEY] = settings.fullscreenShowWindowControls
             pref[FULLSCREEN_SHOW_SHORTCUTS_KEY] = settings.fullscreenShowShortcuts
             pref[FULLSCREEN_REMEMBER_PANEL_OPEN_KEY] = settings.fullscreenRememberPanelOpen
+            pref[MOUSE_SENSITIVITY_KEY] = settings.mouseSensitivity
         }
     }
 
