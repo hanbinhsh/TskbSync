@@ -1,3 +1,5 @@
+import ctypes
+from ctypes import wintypes
 import os
 import subprocess
 import sys
@@ -15,9 +17,12 @@ APP_NAME = "TskbSync Backend"
 AUTOSTART_NAME = "TskbSyncBackendTray"
 WM_TRAYICON = win32con.WM_USER + 20
 TRAY_UID = 1
-TRAY_RETRY_TIMER_ID = 10
-TRAY_RETRY_INTERVAL_MS = 3000
+# Periodically verify the icon is still present and re-add it if the shell
+# dropped it (e.g. Explorer recreated the notification area during logon).
+TRAY_ENSURE_TIMER_ID = 10
+TRAY_ENSURE_INTERVAL_MS = 3000
 TASKBAR_CREATED = win32gui.RegisterWindowMessage("TaskbarCreated")
+MSGFLT_ALLOW = 1
 
 MENU_OPEN_LOGS = 1001
 MENU_RESTART = 1002
@@ -54,10 +59,31 @@ class BackendTray:
     def run(self):
         tray_log("tray starting")
         self._create_window()
+        self._allow_shell_messages()
         self.start_service()
-        if not self._add_tray_icon():
-            self._schedule_tray_retry()
+        self._add_tray_icon()
+        self._start_ensure_timer()
         win32gui.PumpMessages()
+
+    def _allow_shell_messages(self):
+        # When the tray runs elevated (autostart uses /RL HIGHEST), UIPI blocks
+        # messages sent from the medium-integrity shell to this high-integrity
+        # window. Explicitly allow the TaskbarCreated broadcast and the tray
+        # callback so the icon survives Explorer recreating the taskbar.
+        try:
+            user32 = ctypes.windll.user32
+            user32.ChangeWindowMessageFilterEx.argtypes = [
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+            ]
+            user32.ChangeWindowMessageFilterEx.restype = wintypes.BOOL
+            for msg in (TASKBAR_CREATED, WM_TRAYICON):
+                user32.ChangeWindowMessageFilterEx(self.hwnd, msg, MSGFLT_ALLOW, None)
+            tray_log("shell message filter allowed")
+        except Exception as e:
+            tray_log(f"message filter setup failed: {e}")
 
     def _create_window(self):
         message_map = {
@@ -108,7 +134,6 @@ class BackendTray:
         try:
             win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
             self.icon_added = True
-            self._cancel_tray_retry()
             tray_log("tray icon added")
             return True
         except Exception:
@@ -118,12 +143,26 @@ class BackendTray:
                 win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, fallback_nid)
                 self.icon = fallback_icon
                 self.icon_added = True
-                self._cancel_tray_retry()
                 tray_log("tray icon added with fallback icon")
                 return True
             except Exception as e:
                 tray_log(f"tray icon add failed; will retry: {e}")
                 return False
+
+    def _ensure_icon(self):
+        # If the icon was never added (shell not ready at startup) or the shell
+        # silently dropped it, (re)add it now.
+        if not self.icon_added:
+            self._add_tray_icon()
+            return
+        flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
+        nid = (self.hwnd, TRAY_UID, flags, WM_TRAYICON, self.icon, APP_NAME)
+        try:
+            win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, nid)
+        except Exception:
+            tray_log("tray icon missing; re-adding")
+            self.icon_added = False
+            self._add_tray_icon()
 
     def _remove_tray_icon(self):
         if not self.icon_added:
@@ -134,15 +173,15 @@ class BackendTray:
             pass
         self.icon_added = False
 
-    def _schedule_tray_retry(self):
+    def _start_ensure_timer(self):
         try:
-            win32gui.SetTimer(self.hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_INTERVAL_MS, None)
+            win32gui.SetTimer(self.hwnd, TRAY_ENSURE_TIMER_ID, TRAY_ENSURE_INTERVAL_MS, None)
         except Exception as e:
-            tray_log(f"tray retry timer failed: {e}")
+            tray_log(f"tray ensure timer failed: {e}")
 
-    def _cancel_tray_retry(self):
+    def _stop_ensure_timer(self):
         try:
-            win32gui.KillTimer(self.hwnd, TRAY_RETRY_TIMER_ID)
+            win32gui.KillTimer(self.hwnd, TRAY_ENSURE_TIMER_ID)
         except Exception:
             pass
 
@@ -387,14 +426,14 @@ class BackendTray:
         return True
 
     def on_timer(self, hwnd, msg, wparam, lparam):
-        if wparam == TRAY_RETRY_TIMER_ID:
-            self._add_tray_icon()
+        if wparam == TRAY_ENSURE_TIMER_ID:
+            self._ensure_icon()
         return True
 
     def on_taskbar_created(self, hwnd, msg, wparam, lparam):
+        tray_log("taskbar created; re-adding icon")
         self.icon_added = False
-        if not self._add_tray_icon():
-            self._schedule_tray_retry()
+        self._add_tray_icon()
         return True
 
     def on_command(self, hwnd, msg, wparam, lparam):
@@ -417,7 +456,7 @@ class BackendTray:
         return True
 
     def on_destroy(self, hwnd, msg, wparam, lparam):
-        self._cancel_tray_retry()
+        self._stop_ensure_timer()
         self.stop_service()
         self._remove_tray_icon()
         win32gui.PostQuitMessage(0)
