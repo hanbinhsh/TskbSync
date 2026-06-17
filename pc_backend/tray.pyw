@@ -12,6 +12,8 @@ import win32con
 import win32event
 import win32gui
 
+import config as app_config
+
 
 APP_NAME = "TskbSync Backend"
 AUTOSTART_NAME = "TskbSyncBackendTray"
@@ -28,6 +30,9 @@ MENU_OPEN_LOGS = 1001
 MENU_RESTART = 1002
 MENU_AUTOSTART = 1003
 MENU_EXIT = 1004
+MENU_SHOW_PASSWORD = 1005
+MENU_CHANGE_PASSWORD = 1006
+MENU_TOGGLE_TLS = 1007
 ERROR_ALREADY_EXISTS = 183
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -399,8 +404,13 @@ class BackendTray:
         tray_log(f"show native menu at {pos}")
         menu = win32gui.CreatePopupMenu()
         autostart_text = "Disable Admin Autostart" if self.is_autostart_enabled() else "Enable Admin Autostart"
+        tls_text = "Disable Encryption (TLS)" if app_config.load_config().get("use_tls") else "Enable Encryption (TLS)"
         win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_OPEN_LOGS, "Open Console Logs")
         win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_RESTART, "Restart Service")
+        win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_SHOW_PASSWORD, "Show Password")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_CHANGE_PASSWORD, "Change Password")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_TOGGLE_TLS, tls_text)
         win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_AUTOSTART, autostart_text)
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
         win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_EXIT, "Exit Service")
@@ -446,10 +456,85 @@ class BackendTray:
             self.open_logs()
         elif command_id == MENU_RESTART:
             self.restart_service()
+        elif command_id == MENU_SHOW_PASSWORD:
+            self.show_password()
+        elif command_id == MENU_CHANGE_PASSWORD:
+            self.change_password()
+        elif command_id == MENU_TOGGLE_TLS:
+            self.toggle_tls()
         elif command_id == MENU_AUTOSTART:
             self.toggle_autostart()
         elif command_id == MENU_EXIT:
             win32gui.DestroyWindow(self.hwnd)
+
+    def show_password(self):
+        cfg = app_config.ensure_config()
+        win32gui.MessageBox(
+            self.hwnd,
+            f"Connection password:\n\n{cfg.get('password', '')}\n\n"
+            "Enter this in the TskbSync app's settings.",
+            APP_NAME,
+            win32con.MB_ICONINFORMATION,
+        )
+
+    def _prompt_text(self, title, prompt, initial=""):
+        # win32gui has no text input box; use a transient Tk dialog.
+        try:
+            import tkinter
+            from tkinter import simpledialog
+            root = tkinter.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            value = simpledialog.askstring(title, prompt, initialvalue=initial, parent=root)
+            root.destroy()
+            return value
+        except Exception as e:
+            tray_log(f"prompt failed: {e}")
+            return None
+
+    def change_password(self):
+        cfg = app_config.load_config()
+        new_password = self._prompt_text(
+            APP_NAME, "Enter a new connection password:", cfg.get("password", "")
+        )
+        if new_password is None:
+            return
+        new_password = new_password.strip()
+        if not new_password:
+            win32gui.MessageBox(self.hwnd, "Password cannot be empty.", APP_NAME, win32con.MB_ICONERROR)
+            return
+        app_config.set_password(new_password)
+        tray_log("password changed; restarting service")
+        self.restart_service()
+        win32gui.MessageBox(
+            self.hwnd,
+            "Password updated and service restarted.\nUpdate the password in the app too.",
+            APP_NAME,
+            win32con.MB_ICONINFORMATION,
+        )
+
+    def toggle_tls(self):
+        cfg = app_config.load_config()
+        new_state = not bool(cfg.get("use_tls"))
+        if new_state and app_config.ensure_certificate() is None:
+            win32gui.MessageBox(
+                self.hwnd,
+                "Could not create a TLS certificate. Install the 'cryptography' "
+                "Python package, then try again.",
+                APP_NAME,
+                win32con.MB_ICONERROR,
+            )
+            return
+        app_config.set_use_tls(new_state)
+        tray_log(f"tls set to {new_state}; restarting service")
+        self.restart_service()
+        win32gui.MessageBox(
+            self.hwnd,
+            f"Encryption {'enabled' if new_state else 'disabled'} and service restarted.\n"
+            "Toggle the matching 'Encrypt connection' switch in the app.",
+            APP_NAME,
+            win32con.MB_ICONINFORMATION,
+        )
 
     def on_close(self, hwnd, msg, wparam, lparam):
         win32gui.DestroyWindow(self.hwnd)

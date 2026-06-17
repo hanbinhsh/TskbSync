@@ -16,6 +16,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.ktor.client.*
 import io.ktor.client.call.body
+import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.websocket.*
@@ -43,8 +44,15 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.UUID
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 import kotlin.math.roundToLong
+
+data class DiscoveredServer(val ip: String, val name: String)
 
 data class H264VideoConfig(val width: Int, val height: Int, val fps: Int = 60)
 
@@ -83,7 +91,23 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private var activeAudioTrack: AudioTrack? = null
     private var audioGeneration = 0
 
-    private val client = HttpClient {
+    private val client = HttpClient(OkHttp) {
+        engine {
+            // Accept the backend's self-signed certificate when encryption (TLS)
+            // is enabled. This encrypts traffic against passive eavesdropping on
+            // the LAN; it does not verify the certificate identity.
+            config {
+                val trustAll = object : X509TrustManager {
+                    override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                    override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                    override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+                }
+                val sslContext = SSLContext.getInstance("TLS")
+                sslContext.init(null, arrayOf<TrustManager>(trustAll), SecureRandom())
+                sslSocketFactory(sslContext.socketFactory, trustAll)
+                hostnameVerifier { _, _ -> true }
+            }
+        }
         install(ContentNegotiation) {
             json(Json { ignoreUnknownKeys = true })
         }
@@ -108,6 +132,12 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
 
     private val _password = mutableStateOf("")
     val password: State<String> = _password
+
+    private val _useEncryption = mutableStateOf(false)
+    val useEncryption: State<Boolean> = _useEncryption
+
+    private fun wsBase(ip: String) = "${if (_useEncryption.value) "wss" else "ws"}://$ip:8000"
+    private fun httpBase(ip: String) = "${if (_useEncryption.value) "https" else "http"}://$ip:8000"
 
     private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, false, 0, 60, true, true, 0xFF202124.toInt(), 0.87f, 56, true, 2000, false, 18, true, true, true, true, false, 1.8f))
     val theme: State<ThemeSettings> = _theme
@@ -176,7 +206,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
 
     private var activeWsSession: DefaultClientWebSocketSession? = null
     private var wantsGridPreviews = false
-    val discoveredServers = mutableStateListOf<String>()
+    val discoveredServers = mutableStateListOf<DiscoveredServer>()
     private var isDiscovering = false
     private val reconnectBaseDelayMs = 1500L
     private val reconnectMaxDelayMs = 8000L
@@ -207,6 +237,14 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { settingsManager.showTitles.collectLatest { _showTitles.value = it } }
         viewModelScope.launch { settingsManager.shortcuts.collectLatest { _shortcuts.value = it } }
         viewModelScope.launch { settingsManager.windowFilter.collectLatest { _windowFilter.value = it } }
+        viewModelScope.launch {
+            settingsManager.useEncryption.collectLatest { enabled ->
+                val changed = _useEncryption.value != enabled
+                _useEncryption.value = enabled
+                // Reconnect over the new scheme when the toggle flips.
+                if (changed && _pcIp.value.isNotEmpty()) connect(_pcIp.value)
+            }
+        }
     }
 
     fun connect(ip: String) {
@@ -221,7 +259,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                     applyBackendStreamConfig(_theme.value, ip)
                     applyGridPreviewConfig(_theme.value, ip)
                     applyWindowFilterConfig(_windowFilter.value, ip)
-                    client.webSocket("ws://$ip:8000/ws") {
+                    client.webSocket("${wsBase(ip)}/ws") {
                         activeWsSession = this
                         send(Frame.Text(pass))
                         send(Frame.Text(if (wantsGridPreviews) "grid_preview:1" else "grid_preview:0"))
@@ -256,7 +294,9 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                             _lastSyncTime.value = System.currentTimeMillis()
                                         }
                                     }
-                                } catch (e: Exception) { }
+                                } catch (e: Exception) {
+                                    Log.w("TaskbarViewModel", "Failed to parse server message", e)
+                                }
                             }
                         }
                     }
@@ -292,7 +332,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 val streamSettings = _theme.value
                 applyBackendStreamConfig(streamSettings, ip)
                 val livePath = if (streamSettings.useHighPerformanceWindowStreaming) "live_h264" else "live"
-                val liveUrl = "ws://$ip:8000/$livePath/$hwnd" +
+                val liveUrl = "${wsBase(ip)}/$livePath/$hwnd" +
                     "?max_dim=${streamSettings.streamMaxDim}" +
                     "&quality=${streamSettings.streamQuality}" +
                     "&fps=${streamSettings.streamFps}"
@@ -301,6 +341,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 var lastPublishedAt = 0L
                 val publishIntervalMs = (1000f / streamSettings.streamFps.coerceIn(1, 120)).roundToLong().coerceAtLeast(1L)
                 client.webSocket(liveUrl) {
+                    send(Frame.Text(_password.value))
                     Log.i("TaskbarLive", "Live stream connected: hwnd=$hwnd")
                     for (frame in incoming) {
                         when (frame) {
@@ -375,7 +416,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         _audioStatus.value = null
 
         audioJob = viewModelScope.launch {
-            val audioUrl = "ws://$ip:8000/audio/loopback?sample_rate=48000&channels=2&frame_ms=10"
+            val audioUrl = "${wsBase(ip)}/audio/loopback?sample_rate=48000&channels=2&frame_ms=10"
             try {
                 client.webSocket(audioUrl) {
                     send(Frame.Text(pass))
@@ -620,7 +661,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         if (ip.isEmpty() || hwnd == 0L) return
         inputJob = viewModelScope.launch {
             try {
-                client.webSocket("ws://$ip:8000/input/$hwnd") {
+                client.webSocket("${wsBase(ip)}/input/$hwnd") {
                     inputWsSession = this
                     remoteInputTarget = "window:$hwnd"
                     send(Frame.Text(pass))
@@ -659,7 +700,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         if (ip.isEmpty() || monitorIndex <= 0) return
         inputJob = viewModelScope.launch {
             try {
-                client.webSocket("ws://$ip:8000/input/screen/$monitorIndex") {
+                client.webSocket("${wsBase(ip)}/input/screen/$monitorIndex") {
                     inputWsSession = this
                     remoteInputTarget = "screen:$monitorIndex"
                     send(Frame.Text(pass))
@@ -867,7 +908,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             if (ip.isEmpty()) return@launch
             _startMenuAppsLoading.value = true
             try {
-                _startMenuApps.value = client.get("http://$ip:8000/start-menu/apps") {
+                _startMenuApps.value = client.get("${httpBase(ip)}/start-menu/apps") {
                     header("password", _password.value)
                 }.body()
             } catch (e: Exception) {
@@ -918,6 +959,10 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { settingsManager.saveGridColumns(cols); settingsManager.saveShowTitles(show) }
     }
 
+    fun updateUseEncryption(enabled: Boolean) {
+        viewModelScope.launch { settingsManager.saveUseEncryption(enabled) }
+    }
+
     fun updateTheme(newTheme: ThemeSettings) {
         val oldTheme = _theme.value
         if (
@@ -962,7 +1007,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         val ip = ipOverride ?: _pcIp.value
         if (ip.isEmpty()) return
         try {
-            client.post("http://$ip:8000/config/wgc") {
+            client.post("${httpBase(ip)}/config/wgc") {
                 parameter("enabled", true)
                 parameter("max_dim", settings.streamMaxDim)
                 parameter("quality", settings.streamQuality)
@@ -975,7 +1020,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         val ip = ipOverride ?: _pcIp.value
         if (ip.isEmpty()) return
         try {
-            client.post("http://$ip:8000/config/grid_preview") {
+            client.post("${httpBase(ip)}/config/grid_preview") {
                 parameter("interval_ms", settings.gridPreviewIntervalMs)
             }
         } catch (e: Exception) { }
@@ -998,7 +1043,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             val ip = _pcIp.value
             if (ip.isEmpty()) return@launch
             try {
-                _h264Status.value = client.get("http://$ip:8000/h264/status") {
+                _h264Status.value = client.get("${httpBase(ip)}/h264/status") {
                     parameter("refresh", refresh)
                 }.body()
             } catch (e: Exception) {
@@ -1014,7 +1059,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         val ip = ipOverride ?: _pcIp.value
         if (ip.isEmpty()) return
         try {
-            client.post("http://$ip:8000/config/window_filter") {
+            client.post("${httpBase(ip)}/config/window_filter") {
                 contentType(ContentType.Application.Json)
                 setBody(buildJsonObject {
                     put("enabled", settings.enabled)
@@ -1042,7 +1087,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 applyBackendStreamConfig(streamSettings, ip)
                 val useScreenHardware = streamSettings.useHardwareEncoding
                 val livePath = if (useScreenHardware) "live_h264/screen" else "live/screen"
-                val liveUrl = "ws://$ip:8000/$livePath/$monitorIndex" +
+                val liveUrl = "${wsBase(ip)}/$livePath/$monitorIndex" +
                     "?max_dim=${streamSettings.streamMaxDim}" +
                     "&quality=${streamSettings.streamQuality}" +
                     "&fps=${streamSettings.streamFps}"
@@ -1050,6 +1095,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 var lastPublishedAt = 0L
                 val publishIntervalMs = (1000f / streamSettings.streamFps.coerceIn(1, 120)).roundToLong().coerceAtLeast(1L)
                 client.webSocket(liveUrl) {
+                    send(Frame.Text(_password.value))
                     for (frame in incoming) {
                         if (frame is Frame.Binary) {
                             val bytes = frame.readBytes()
@@ -1097,7 +1143,9 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             val ip = _pcIp.value
             if (ip.isEmpty()) return@launch
             try {
-                val res: List<ScreenInfo> = client.get("http://$ip:8000/screens").body()
+                val res: List<ScreenInfo> = client.get("${httpBase(ip)}/screens") {
+                    header("password", _password.value)
+                }.body()
                 _screens.value = res
                 Log.i("TaskbarScreens", "Fetched screens: ${res.size}")
             } catch (e: Exception) {
@@ -1118,7 +1166,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private suspend fun fetchExtendedDisplayStatusNow(ip: String = _pcIp.value): ExtendedDisplayStatus? {
         if (ip.isEmpty()) return null
         return try {
-            val status: ExtendedDisplayStatus = client.get("http://$ip:8000/extended_display/status") {
+            val status: ExtendedDisplayStatus = client.get("${httpBase(ip)}/extended_display/status") {
                 header("password", _password.value)
             }.body()
             _extendedDisplayStatus.value = status
@@ -1140,7 +1188,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         _extendedDisplayConnecting.value = true
         viewModelScope.launch {
             try {
-                val response: ExtendedDisplayConnectResponse = client.post("http://$ip:8000/extended_display/connect") {
+                val response: ExtendedDisplayConnectResponse = client.post("${httpBase(ip)}/extended_display/connect") {
                     header("password", _password.value)
                     contentType(ContentType.Application.Json)
                     setBody(buildJsonObject {
@@ -1176,7 +1224,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         if (ip.isEmpty()) return
         viewModelScope.launch {
             runCatching {
-                client.post("http://$ip:8000/extended_display/disconnect") {
+                client.post("${httpBase(ip)}/extended_display/disconnect") {
                     header("password", _password.value)
                     contentType(ContentType.Application.Json)
                     setBody(buildJsonObject { put("client_id", clientId) }.toString())
@@ -1201,7 +1249,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         }
         viewModelScope.launch {
             try {
-                val response: ExtendedDisplayStatus = client.post("http://$ip:8000/extended_display/driver_state") {
+                val response: ExtendedDisplayStatus = client.post("${httpBase(ip)}/extended_display/driver_state") {
                     header("password", _password.value)
                     contentType(ContentType.Application.Json)
                     timeout { requestTimeoutMillis = 25000 }
@@ -1277,7 +1325,13 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                     try {
                         socket.receive(packet)
                         val senderIp = packet.address.hostAddress ?: continue
-                        if (!discoveredServers.contains(senderIp)) { discoveredServers.add(senderIp) }
+                        val hostname = runCatching {
+                            val obj = Json.parseToJsonElement(String(packet.data, 0, packet.length)).jsonObject
+                            obj["hostname"]?.jsonPrimitive?.contentOrNull
+                        }.getOrNull()?.takeIf { it.isNotBlank() } ?: senderIp
+                        if (discoveredServers.none { it.ip == senderIp }) {
+                            discoveredServers.add(DiscoveredServer(senderIp, hostname))
+                        }
                     } catch (e: Exception) { }
                 }
             } catch (e: Exception) { }
@@ -1287,7 +1341,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
 
     fun switchWindow(hwnd: Long) {
         viewModelScope.launch {
-            try { client.post("http://${_pcIp.value}:8000/switch/$hwnd") { header("password", _password.value) } } catch (e: Exception) { }
+            try { client.post("${httpBase(_pcIp.value)}/switch/$hwnd") { header("password", _password.value) } } catch (e: Exception) { }
         }
     }
 
@@ -1296,7 +1350,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             val ip = _pcIp.value
             if (ip.isEmpty() || hwnd == 0L) return@launch
             try {
-                client.post("http://$ip:8000/window/$hwnd/control") {
+                client.post("${httpBase(ip)}/window/$hwnd/control") {
                     header("password", _password.value)
                     contentType(ContentType.Application.Json)
                     setBody(buildJsonObject {
@@ -1308,6 +1362,33 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("TaskbarViewModel", "Window control failed", e)
                 _inputStatus.value = "Window control failed: ${e.localizedMessage}"
             }
+        }
+    }
+
+    private var pausedStreamHwnd: Long? = null
+    private var pausedScreenIndex: Int? = null
+
+    /** Called when the app goes to the background: stop the heavy video/audio
+     *  streams to save battery and bandwidth, remembering what to resume. */
+    fun onEnterBackground() {
+        if (liveStreamJob?.isActive == true) {
+            pausedScreenIndex = activeScreenStreamIndex
+            pausedStreamHwnd = if (activeScreenStreamIndex == null) _selectedRowHwnd.value else null
+        }
+        liveStreamJob?.cancel()
+        stopAudioStream()
+    }
+
+    /** Called when the app returns to the foreground: resume whatever stream
+     *  was active before backgrounding. */
+    fun onEnterForeground() {
+        val idx = pausedScreenIndex
+        val hwnd = pausedStreamHwnd
+        pausedScreenIndex = null
+        pausedStreamHwnd = null
+        when {
+            idx != null && idx > 0 -> startLiveScreenStream(idx)
+            hwnd != null && hwnd != 0L -> startLiveStream(hwnd)
         }
     }
 

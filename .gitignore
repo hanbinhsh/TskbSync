@@ -28,6 +28,8 @@ env/
 .coverage
 htmlcov/
 pc_backend/logs/
+pc_backend/config.json
+pc_backend/certs/
 pc_backend/ffmpeg_path.txt
 pc_backend/bin/ffmpeg.exe
 pc_backend/bin/ffprobe.exe

@@ -33,6 +33,7 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val pcIp by viewModel.pcIp
     val password by viewModel.password
     val theme by viewModel.theme
+    val useEncryption by viewModel.useEncryption
     val discovered = viewModel.discoveredServers
     val gridCols by viewModel.gridColumns
     val showTitles by viewModel.showTitles
@@ -134,8 +135,14 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                             if (discovered.isEmpty()) {
                                                 DropdownMenuItem(text = { Text("Scanning...") }, onClick = {})
                                             } else {
-                                                discovered.forEach { ip ->
-                                                    DropdownMenuItem(text = { Text(ip) }, onClick = { tempIp = ip; expanded = false })
+                                                discovered.forEach { server ->
+                                                    DropdownMenuItem(
+                                                        text = {
+                                                            if (server.name == server.ip) Text(server.ip)
+                                                            else Text("${server.name}  (${server.ip})")
+                                                        },
+                                                        onClick = { tempIp = server.ip; expanded = false }
+                                                    )
                                                 }
                                             }
                                         }
@@ -161,6 +168,15 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     ) {
                                         Text("Apply and Connect", fontWeight = FontWeight.Bold)
                                     }
+                            }
+                            SettingsSection("Security") {
+                                SettingsSwitchRow(
+                                    title = "Encrypt Connection (TLS)",
+                                    subtitle = "Must match the tray's encryption setting on the PC. " +
+                                        "Accepts the backend's self-signed certificate.",
+                                    checked = useEncryption,
+                                    onCheckedChange = { viewModel.updateUseEncryption(it) }
+                                )
                             }
                         }
 

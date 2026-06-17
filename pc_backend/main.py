@@ -789,7 +789,11 @@ def get_windows_list_minimal():
 
 
 # --- 核心变量与服务器生命周期配置 ---
-PASSWORD = "123"
+import config as app_config
+
+_CONFIG = app_config.ensure_config()
+PASSWORD = _CONFIG.get("password") or "123"
+USE_TLS = bool(_CONFIG.get("use_tls"))
 PORT = 8000
 DISCOVERY_PORT = 8001
 USE_WGC = False
@@ -1958,7 +1962,9 @@ async def start_menu_apps_endpoint(request: Request):
     return get_start_menu_apps()
 
 @app.get("/screens")
-async def screens_endpoint():
+async def screens_endpoint(request: Request):
+    if not _authorized_request(request):
+        return JSONResponse(status_code=401, content={"message": "Invalid password"})
     return get_screens_list()
 
 @app.get("/windows")
@@ -1969,6 +1975,26 @@ async def windows_endpoint(request: Request):
 
 def _authorized_request(request: Request):
     return request.headers.get("password") == PASSWORD
+
+async def _authorize_ws(websocket: WebSocket) -> bool:
+    """Verify the first text frame is the password; close otherwise.
+
+    The websocket must already be accepted. Used to gate the live/screen
+    streams so screen content is not exposed to unauthenticated clients.
+    """
+    try:
+        pw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+    except Exception:
+        await safe_close(websocket)
+        return False
+    if pw != PASSWORD:
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": "auth failed"}))
+        except Exception:
+            pass
+        await safe_close(websocket)
+        return False
+    return True
 
 def get_extended_display_status_payload():
     screens = get_screens_list()
@@ -2331,6 +2357,8 @@ async def live_stream_endpoint(
 ):
     global active_live_streams
     await websocket.accept()
+    if not await _authorize_ws(websocket):
+        return
     capture = None
     capture_control = None
     active_live_streams += 1
@@ -2448,6 +2476,8 @@ async def live_screen_stream_endpoint(
 ):
     global active_live_streams
     await websocket.accept()
+    if not await _authorize_ws(websocket):
+        return
     capture = None
     capture_control = None
     active_live_streams += 1
@@ -3266,6 +3296,8 @@ async def live_h264_stream_endpoint(
 ):
     global active_live_streams
     await websocket.accept()
+    if not await _authorize_ws(websocket):
+        return
     active_live_streams += 1
     try:
         stream_max_dim = float(max(360, min(max_dim if max_dim is not None else int(LIVE_MAX_DIM), 3840)))
@@ -3326,6 +3358,8 @@ async def live_h264_screen_stream_endpoint(
 ):
     global active_live_streams
     await websocket.accept()
+    if not await _authorize_ws(websocket):
+        return
     active_live_streams += 1
     try:
         try:
@@ -3950,11 +3984,25 @@ def udp_discovery():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    msg = json.dumps({"type": "tskb_sync", "port": PORT}).encode()
+    msg = json.dumps({
+        "type": "tskb_sync",
+        "port": PORT,
+        "hostname": socket.gethostname(),
+        "tls": USE_TLS,
+    }).encode()
     while not shutdown_event.is_set(): # 关键修复！Ctrl+C时线程自动结束
         try: sock.sendto(msg, ('255.255.255.255', DISCOVERY_PORT))
         except: pass
         shutdown_event.wait(2.0)
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="warning")
+    ssl_kwargs = {}
+    if USE_TLS:
+        cert = app_config.ensure_certificate()
+        if cert:
+            ssl_kwargs = {"ssl_certfile": cert[0], "ssl_keyfile": cert[1]}
+            print(f"[startup] TLS enabled, cert={cert[0]}", flush=True)
+        else:
+            print("[startup] TLS requested but certificate generation failed "
+                  "(is the 'cryptography' package installed?); starting without TLS", flush=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="warning", **ssl_kwargs)

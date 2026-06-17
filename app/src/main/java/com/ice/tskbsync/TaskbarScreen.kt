@@ -94,6 +94,9 @@ import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+// Maps two-finger drag distance (preview pixels) to mouse-wheel notches.
+private const val TWO_FINGER_SCROLL_FACTOR = 2.5f
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalAnimationApi::class)
 @Composable
 fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
@@ -404,6 +407,8 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     inputMode = landscapeInputMode,
                                     mouseSensitivity = theme.mouseSensitivity,
                                     onMouseInput = { action, x, y -> viewModel.sendMouseInput(action, x, y) },
+                                    onMouseRightClick = { viewModel.sendMouseButtonClick("right") },
+                                    onMouseWheel = { delta -> viewModel.sendMouseWheel(delta) },
                                     onTouchInput = { action, x, y -> viewModel.sendTouchInput(action, x, y) },
                                     onMultiTouchInput = { points -> viewModel.sendMultiTouchInput(points) }
                                 )
@@ -691,6 +696,8 @@ fun FullscreenWindowPreview(
     inputMode: String,
     mouseSensitivity: Float,
     onMouseInput: (String, Float, Float) -> Unit,
+    onMouseRightClick: () -> Unit,
+    onMouseWheel: (Int) -> Unit,
     onTouchInput: (String, Float, Float) -> Unit,
     onMultiTouchInput: (List<TouchPointInput>) -> Unit
 ) {
@@ -732,6 +739,9 @@ fun FullscreenWindowPreview(
                     var lastRawY = down.position.y
                     var accDx = 0f
                     var accDy = 0f
+                    var sawTwoFingers = false
+                    var twoFingerScrolled = false
+                    var lastTwoFingerY: Float? = null
                     if (inputMode == "touch") {
                         onMultiTouchInput(
                             listOf(
@@ -778,18 +788,39 @@ fun FullscreenWindowPreview(
                                 lastTouchSentAt = now
                             }
                         } else {
-                            // Accumulate scaled pixel delta; keep the sub-pixel remainder
-                            // so slow drags aren't lost to integer rounding.
-                            accDx += (change.position.x - lastRawX) * mouseSensitivity
-                            accDy += (change.position.y - lastRawY) * mouseSensitivity
-                            lastRawX = change.position.x
-                            lastRawY = change.position.y
-                            val sendDx = accDx.toInt()
-                            val sendDy = accDy.toInt()
-                            if (sendDx != 0 || sendDy != 0) {
-                                onMouseInput("move_rel", sendDx.toFloat(), sendDy.toFloat())
-                                accDx -= sendDx
-                                accDy -= sendDy
+                            val pressed = event.changes.filter { it.pressed }
+                            if (pressed.size >= 2) {
+                                // Two-finger gesture → scroll wheel; suppress cursor move.
+                                sawTwoFingers = true
+                                val avgY = pressed.map { it.position.y }.average().toFloat()
+                                lastTwoFingerY?.let { prev ->
+                                    val dy = avgY - prev
+                                    if (abs(dy) > 0.5f) {
+                                        twoFingerScrolled = true
+                                        onMouseWheel((-dy * TWO_FINGER_SCROLL_FACTOR).roundToInt().coerceIn(-120, 120))
+                                    }
+                                }
+                                lastTwoFingerY = avgY
+                            } else if (!sawTwoFingers) {
+                                // Single-finger relative move. Accumulate scaled pixel delta;
+                                // keep the sub-pixel remainder so slow drags aren't lost to
+                                // integer rounding.
+                                accDx += (change.position.x - lastRawX) * mouseSensitivity
+                                accDy += (change.position.y - lastRawY) * mouseSensitivity
+                                lastRawX = change.position.x
+                                lastRawY = change.position.y
+                                val sendDx = accDx.toInt()
+                                val sendDy = accDy.toInt()
+                                if (sendDx != 0 || sendDy != 0) {
+                                    onMouseInput("move_rel", sendDx.toFloat(), sendDy.toFloat())
+                                    accDx -= sendDx
+                                    accDy -= sendDy
+                                }
+                            } else {
+                                // Back to one finger after a two-finger gesture: resync anchor.
+                                lastRawX = change.position.x
+                                lastRawY = change.position.y
+                                lastTwoFingerY = null
                             }
                         }
                         lastX = x
@@ -810,6 +841,9 @@ fun FullscreenWindowPreview(
                                 )
                             )
                         )
+                    } else if (sawTwoFingers) {
+                        // Two-finger tap (no scroll) → right click.
+                        if (!twoFingerScrolled) onMouseRightClick()
                     } else if (!moved) {
                         onMouseInput("click", startX, startY)
                     }
@@ -1823,6 +1857,9 @@ fun LandscapeSingleMode(
                                         var lastRawY = down.position.y
                                         var accDx = 0f
                                         var accDy = 0f
+                                        var sawTwoFingers = false
+                                        var twoFingerScrolled = false
+                                        var lastTwoFingerY: Float? = null
                                         if (inputMode == "touch") {
                                             onMultiTouchInput(
                                                 listOf(
@@ -1868,27 +1905,54 @@ fun LandscapeSingleMode(
                                                     onMultiTouchInput(points)
                                                     lastTouchSentAt = now
                                                 }
-                                            } else if (change.pressed) {
-                                                // Accumulate scaled pixel delta; keep the sub-pixel remainder
-                                                // so slow drags aren't lost to integer rounding.
-                                                accDx += (change.position.x - lastRawX) * mouseSensitivity
-                                                accDy += (change.position.y - lastRawY) * mouseSensitivity
-                                                lastRawX = change.position.x
-                                                lastRawY = change.position.y
-                                                val sendDx = accDx.toInt()
-                                                val sendDy = accDy.toInt()
-                                                if (sendDx != 0 || sendDy != 0) {
-                                                    onMouseInput("move_rel", sendDx.toFloat(), sendDy.toFloat())
-                                                    accDx -= sendDx
-                                                    accDy -= sendDy
+                                            } else {
+                                                val pressed = event.changes.filter { it.pressed }
+                                                if (pressed.size >= 2) {
+                                                    // Two-finger gesture → scroll wheel; suppress cursor move.
+                                                    sawTwoFingers = true
+                                                    val avgY = pressed.map { it.position.y }.average().toFloat()
+                                                    lastTwoFingerY?.let { prev ->
+                                                        val dy = avgY - prev
+                                                        if (abs(dy) > 0.5f) {
+                                                            twoFingerScrolled = true
+                                                            onMouseWheel((-dy * TWO_FINGER_SCROLL_FACTOR).roundToInt().coerceIn(-120, 120))
+                                                        }
+                                                    }
+                                                    lastTwoFingerY = avgY
+                                                } else if (!sawTwoFingers) {
+                                                    // Single-finger relative move. Accumulate scaled pixel
+                                                    // delta; keep the sub-pixel remainder so slow drags
+                                                    // aren't lost to integer rounding.
+                                                    accDx += (change.position.x - lastRawX) * mouseSensitivity
+                                                    accDy += (change.position.y - lastRawY) * mouseSensitivity
+                                                    lastRawX = change.position.x
+                                                    lastRawY = change.position.y
+                                                    val sendDx = accDx.toInt()
+                                                    val sendDy = accDy.toInt()
+                                                    if (sendDx != 0 || sendDy != 0) {
+                                                        onMouseInput("move_rel", sendDx.toFloat(), sendDy.toFloat())
+                                                        accDx -= sendDx
+                                                        accDy -= sendDy
+                                                    }
+                                                } else {
+                                                    // Back to one finger after a two-finger gesture: resync anchor.
+                                                    lastRawX = change.position.x
+                                                    lastRawY = change.position.y
+                                                    lastTwoFingerY = null
                                                 }
-                                            } else if (!moved) {
-                                                onMouseInput("click", startX, startY)
                                             }
                                             lastX = x
                                             lastY = y
-                                            change.consume()
+                                            event.changes.forEach { it.consume() }
                                         } while (event.changes.any { it.pressed })
+
+                                        if (inputMode != "touch") {
+                                            if (sawTwoFingers) {
+                                                if (!twoFingerScrolled) onMouseRightClick()
+                                            } else if (!moved) {
+                                                onMouseInput("click", startX, startY)
+                                            }
+                                        }
                                     }
                                 },
                             contentAlignment = Alignment.Center

@@ -107,6 +107,7 @@ class SettingsManager(private val context: Context) {
         private val MOUSE_SENSITIVITY_KEY = floatPreferencesKey("mouse_sensitivity")
         private val WINDOW_FILTER_KEY = stringPreferencesKey("window_filter")
         private val SHORTCUTS_KEY = stringPreferencesKey("shortcuts")
+        private val USE_ENCRYPTION_KEY = booleanPreferencesKey("use_encryption")
     }
 
     val pcIp: Flow<String> = context.dataStore.data.map { it[PC_IP_KEY] ?: "" }
@@ -114,6 +115,7 @@ class SettingsManager(private val context: Context) {
     val layoutMode: Flow<String> = context.dataStore.data.map { it[LAYOUT_MODE_KEY] ?: "grid" }
     val gridColumns: Flow<Int> = context.dataStore.data.map { it[GRID_COLUMNS_KEY] ?: 3 }
     val showTitles: Flow<Boolean> = context.dataStore.data.map { it[SHOW_TITLES_KEY] ?: true }
+    val useEncryption: Flow<Boolean> = context.dataStore.data.map { it[USE_ENCRYPTION_KEY] ?: false }
     val shortcuts: Flow<List<ShortcutConfig>> = context.dataStore.data.map { pref ->
         val raw = pref[SHORTCUTS_KEY]
         if (raw.isNullOrEmpty()) {
@@ -184,6 +186,7 @@ class SettingsManager(private val context: Context) {
     suspend fun saveLayoutMode(mode: String) { context.dataStore.edit { it[LAYOUT_MODE_KEY] = mode } }
     suspend fun saveGridColumns(cols: Int) { context.dataStore.edit { it[GRID_COLUMNS_KEY] = cols } }
     suspend fun saveShowTitles(show: Boolean) { context.dataStore.edit { it[SHOW_TITLES_KEY] = show } }
+    suspend fun saveUseEncryption(enabled: Boolean) { context.dataStore.edit { it[USE_ENCRYPTION_KEY] = enabled } }
     suspend fun saveShortcuts(shortcuts: List<ShortcutConfig>) {
         context.dataStore.edit { it[SHORTCUTS_KEY] = Json.encodeToString(shortcuts) }
     }
