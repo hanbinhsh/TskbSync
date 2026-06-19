@@ -102,6 +102,7 @@ private const val TWO_FINGER_SCROLL_FACTOR = 2.5f
 fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
     val windows by viewModel.windows
     val isConnected by viewModel.isConnected
+    val connectionState by viewModel.connectionState
     val error by viewModel.error
     val pcIp by viewModel.pcIp
     val theme by viewModel.theme
@@ -386,7 +387,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                         val isAlreadyLandscape = maxWidth > maxHeight
                         val fullscreenContent: @Composable BoxScope.() -> Unit = {
                             if (!isConnected) {
-                                ConnectionStatusPlaceholder(pcIp, error, titleColor) { viewModel.connect(pcIp) }
+                                ConnectionStatusPlaceholder(pcIp, error, connectionState, titleColor) { viewModel.connect(pcIp) }
                             } else if (controlledWindow == null) {
                                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                     Text("No window", color = titleColor.copy(alpha = 0.75f))
@@ -518,7 +519,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                         }
                         val landscapeContent: @Composable BoxScope.() -> Unit = {
                             if (!isConnected) {
-                                ConnectionStatusPlaceholder(pcIp, error, titleColor) { viewModel.connect(pcIp) }
+                                ConnectionStatusPlaceholder(pcIp, error, connectionState, titleColor) { viewModel.connect(pcIp) }
                             } else {
                                 LandscapeSingleMode(
                                     windows = windows,
@@ -615,7 +616,7 @@ fun TaskbarScreen(viewModel: TaskbarViewModel, navController: NavController) {
                 } else {
                     Column(modifier = Modifier.fillMaxSize().padding(padding), horizontalAlignment = Alignment.CenterHorizontally) {
                     if (!isConnected) {
-                        ConnectionStatusPlaceholder(pcIp, error, titleColor) { viewModel.connect(pcIp) }
+                        ConnectionStatusPlaceholder(pcIp, error, connectionState, titleColor) { viewModel.connect(pcIp) }
                     } else {
                         AnimatedContent(
                             targetState = contentMode,
@@ -2260,13 +2261,31 @@ fun LandscapeSingleMode(
     }
 
 @Composable
-fun ConnectionStatusPlaceholder(pcIp: String, error: String?, tint: Color, onRetry: () -> Unit) {
+fun ConnectionStatusPlaceholder(
+    pcIp: String,
+    error: String?,
+    state: ConnectionState,
+    tint: Color,
+    onRetry: () -> Unit
+) {
+    val busy = state == ConnectionState.CONNECTING || state == ConnectionState.RECONNECTING
     Column(modifier = Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("Disconnected", style = MaterialTheme.typography.headlineSmall, color = tint.copy(alpha = 0.5f))
+        if (busy) {
+            CircularProgressIndicator(color = tint.copy(alpha = 0.8f), strokeWidth = 3.dp)
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+        val headline = when (state) {
+            ConnectionState.CONNECTING -> "Connecting…"
+            ConnectionState.RECONNECTING -> "Reconnecting…"
+            else -> "Disconnected"
+        }
+        Text(headline, style = MaterialTheme.typography.headlineSmall, color = tint.copy(alpha = if (busy) 0.8f else 0.5f))
         Text("Target: ${pcIp.ifEmpty { "None" }}", color = tint.copy(alpha = 0.7f))
         if (error != null) { Text(text = error, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 8.dp), fontSize = 12.sp) }
-        Spacer(modifier = Modifier.height(24.dp))
-        Button(onClick = onRetry) { Icon(Icons.Default.Refresh, null); Spacer(Modifier.width(8.dp)); Text("Retry Connection") }
+        if (!busy) {
+            Spacer(modifier = Modifier.height(24.dp))
+            Button(onClick = onRetry) { Icon(Icons.Default.Refresh, null); Spacer(Modifier.width(8.dp)); Text("Retry Connection") }
+        }
     }
 }
 

@@ -795,6 +795,12 @@ _CONFIG = app_config.ensure_config()
 PASSWORD = _CONFIG.get("password") or "123"
 USE_TLS = bool(_CONFIG.get("use_tls"))
 PORT = 8000
+
+# Win32 input calls (SetCursorPos, SendInput, focus_window, ...) are blocking.
+# Running them on a dedicated single worker thread keeps the asyncio event loop
+# free to keep streaming video while input is processed, cutting control latency.
+# A single worker preserves the order of input events.
+input_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="input")
 DISCOVERY_PORT = 8001
 USE_WGC = False
 WGC_REQUESTED = False
@@ -1320,6 +1326,30 @@ def get_current_display_mode(device_name: str):
         }
     except Exception:
         return None
+
+DISP_CHANGE_MESSAGES = {
+    0: "Resolution changed",            # DISP_CHANGE_SUCCESSFUL
+    1: "Changed; a restart is required", # DISP_CHANGE_RESTART
+    -1: "The display driver rejected the change",  # DISP_CHANGE_FAILED
+    -2: "The display does not support this mode",   # DISP_CHANGE_BADMODE
+    -3: "Unable to write the new settings to the registry",  # DISP_CHANGE_NOTUPDATED
+    -4: "Invalid flags",                # DISP_CHANGE_BADFLAGS
+    -5: "Invalid parameter",            # DISP_CHANGE_BADPARAM
+    -6: "Invalid dual-view configuration",  # DISP_CHANGE_BADDUALVIEW
+}
+
+def set_display_mode(device_name: str, width: int, height: int, fps: int = 0):
+    """Apply a resolution/refresh-rate to a display device. Returns the
+    ChangeDisplaySettingsEx result code (0 = success)."""
+    devmode = win32api.EnumDisplaySettings(device_name, win32con.ENUM_CURRENT_SETTINGS)
+    devmode.PelsWidth = int(width)
+    devmode.PelsHeight = int(height)
+    fields = win32con.DM_PELSWIDTH | win32con.DM_PELSHEIGHT
+    if fps and int(fps) > 0:
+        devmode.DisplayFrequency = int(fps)
+        fields |= win32con.DM_DISPLAYFREQUENCY
+    devmode.Fields = fields
+    return win32api.ChangeDisplaySettingsEx(device_name, devmode, win32con.CDS_UPDATEREGISTRY)
 
 def get_screens_list():
     screens = []
@@ -2008,8 +2038,12 @@ def get_extended_display_status_payload():
     bound_screen = next((screen for screen in virtual_screens if str(screen.get("device", "")).lower() == bound_device.lower()), None)
     if not bound_screen and EXTENDED_DISPLAY_BINDING.get("monitor_index"):
         bound_screen = next((screen for screen in virtual_screens if int(screen.get("monitor_index", 0)) == int(EXTENDED_DISPLAY_BINDING["monitor_index"])), None)
-    current_mode = get_current_display_mode(bound_screen["device"]) if bound_screen else None
-    supported_modes = get_supported_display_modes(bound_screen["device"], limit=32) if bound_screen else []
+    # Modes are reported for the bound screen, or the first virtual screen so the
+    # resolution can be changed even before the app "connects" to it.
+    mode_screen = bound_screen or (virtual_screens[0] if virtual_screens else None)
+    current_mode = get_current_display_mode(mode_screen["device"]) if mode_screen else None
+    supported_modes = get_supported_display_modes(mode_screen["device"], limit=32) if mode_screen else []
+    mode_monitor_index = int(mode_screen.get("monitor_index", 0)) if mode_screen else 0
     available = bool(virtual_screens)
     driver_enabled = pnp_device_enabled(pnp_device) or available
     driver_status = str(pnp_device.get("status", "")) if pnp_device else ""
@@ -2041,6 +2075,7 @@ def get_extended_display_status_payload():
         "screen": bound_screen,
         "current_mode": current_mode,
         "supported_modes": supported_modes,
+        "mode_monitor_index": mode_monitor_index,
         "virtual_devices": virtual_devices,
         "pnp_device": pnp_device,
     }
@@ -2134,6 +2169,55 @@ async def extended_display_driver_state(request: Request):
         data = {}
     return await asyncio.to_thread(set_extended_display_driver_state_payload, data)
 
+@app.post("/extended_display/set_mode")
+async def extended_display_set_mode(request: Request):
+    if not _authorized_request(request):
+        return JSONResponse(status_code=401, content={"message": "Invalid password"})
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    return await asyncio.to_thread(set_extended_display_mode_payload, data)
+
+def set_extended_display_mode_payload(data: dict):
+    try:
+        width = int(data.get("width", 0))
+        height = int(data.get("height", 0))
+        fps = int(data.get("fps", 0) or 0)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid width/height/fps"})
+    device = str(data.get("device", "")).strip()
+    monitor_index = data.get("monitor_index")
+
+    # Resolve the device name from the monitor index if it wasn't supplied.
+    if not device and monitor_index is not None:
+        try:
+            target = int(monitor_index)
+            screen = next((s for s in get_screens_list() if int(s.get("monitor_index", 0)) == target), None)
+            if screen:
+                device = str(screen.get("device", ""))
+        except (TypeError, ValueError):
+            pass
+
+    if not device or width <= 0 or height <= 0:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "device, width and height are required"})
+
+    try:
+        result = set_display_mode(device, width, height, fps)
+    except Exception as e:
+        print(f"[extended] set_mode {device} {width}x{height}@{fps} failed: {type(e).__name__}: {e}", flush=True)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+    if result in (0, 1):  # SUCCESSFUL or RESTART
+        status = get_extended_display_status_payload()
+        status["status"] = "ok"
+        status["message"] = DISP_CHANGE_MESSAGES.get(result, "Resolution changed")
+        status["current_mode"] = get_current_display_mode(device)
+        return status
+    message = DISP_CHANGE_MESSAGES.get(result, f"Change failed (code {result})")
+    print(f"[extended] set_mode {device} {width}x{height}@{fps} -> {result} ({message})", flush=True)
+    return JSONResponse(status_code=400, content={"status": "error", "message": message, "code": result})
+
 def set_extended_display_driver_state_payload(data: dict):
     enabled = bool(data.get("enabled", False))
     client_id = str(data.get("client_id", "")).strip()
@@ -2223,17 +2307,18 @@ async def input_endpoint(websocket: WebSocket, hwnd: int):
         print(f"[input] connected hwnd={hwnd} title={win32gui.GetWindowText(hwnd)!r} build={INPUT_TOUCH_BUILD}", flush=True)
         await websocket.send_text(json.dumps({"type": "status", "message": f"input connected {INPUT_TOUCH_BUILD}"}))
 
+        loop = asyncio.get_event_loop()
         while not shutdown_event.is_set():
             raw = await websocket.receive_text()
             try:
                 data = json.loads(raw)
                 event_type = data.get("type")
                 if event_type == "mouse":
-                    handle_mouse_input(hwnd, data)
+                    await loop.run_in_executor(input_executor, handle_mouse_input, hwnd, data)
                 elif event_type == "touch":
-                    handle_touch_input(hwnd, data)
+                    await loop.run_in_executor(input_executor, handle_touch_input, hwnd, data)
                 elif event_type == "touch_multi":
-                    handle_multi_touch_input(hwnd, data)
+                    await loop.run_in_executor(input_executor, handle_multi_touch_input, hwnd, data)
                 elif event_type == "text":
                     text = data.get("text", "")
                     print(f"[input] text hwnd={hwnd} chars={len(text)} text={text!r}", flush=True)
@@ -2286,17 +2371,18 @@ async def input_screen_endpoint(websocket: WebSocket, monitor_index: int):
         print(f"[input] connected screen={monitor_index} rect={screen}", flush=True)
         await websocket.send_text(json.dumps({"type": "status", "message": f"screen input connected {monitor_index}"}))
 
+        loop = asyncio.get_event_loop()
         while not shutdown_event.is_set():
             raw = await websocket.receive_text()
             try:
                 data = json.loads(raw)
                 event_type = data.get("type")
                 if event_type == "mouse":
-                    handle_mouse_screen_input(monitor_index, data)
+                    await loop.run_in_executor(input_executor, handle_mouse_screen_input, monitor_index, data)
                 elif event_type == "touch":
-                    handle_touch_screen_input(monitor_index, data)
+                    await loop.run_in_executor(input_executor, handle_touch_screen_input, monitor_index, data)
                 elif event_type == "touch_multi":
-                    handle_multi_touch_screen_input(monitor_index, data)
+                    await loop.run_in_executor(input_executor, handle_multi_touch_screen_input, monitor_index, data)
                 elif event_type == "text":
                     send_unicode_text(data.get("text", ""))
                 elif event_type == "key":
@@ -3980,20 +4066,54 @@ async def grid_preview_broadcaster():
             elapsed = time.perf_counter() - started_at
             await asyncio.sleep(max(0.05, GRID_PREVIEW_INTERVAL - elapsed))
 
+def _broadcast_addresses():
+    # Limited broadcast plus a /24-directed broadcast per local IPv4, since some
+    # access points drop 255.255.255.255 but forward subnet-directed broadcasts.
+    addrs = {"255.255.255.255"}
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip.startswith("127.") or ip.count(".") != 3:
+                continue
+            parts = ip.split(".")
+            addrs.add(".".join(parts[:3] + ["255"]))
+    except Exception:
+        pass
+    return addrs
+
 def udp_discovery():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    try:
+        # Bind so we can also receive discovery probes from clients and reply
+        # by unicast (works even when the client can't receive our broadcasts).
+        sock.bind(("", DISCOVERY_PORT))
+    except Exception as e:
+        print(f"[discovery] bind failed: {e}", flush=True)
+    sock.settimeout(1.0)
     msg = json.dumps({
         "type": "tskb_sync",
         "port": PORT,
         "hostname": socket.gethostname(),
         "tls": USE_TLS,
     }).encode()
+    last_broadcast = 0.0
     while not shutdown_event.is_set(): # 关键修复！Ctrl+C时线程自动结束
-        try: sock.sendto(msg, ('255.255.255.255', DISCOVERY_PORT))
-        except: pass
-        shutdown_event.wait(2.0)
+        now = time.monotonic()
+        if now - last_broadcast >= 1.0:
+            for addr in _broadcast_addresses():
+                try: sock.sendto(msg, (addr, DISCOVERY_PORT))
+                except: pass
+            last_broadcast = now
+        try:
+            data, src = sock.recvfrom(1024)
+            if b"tskb_probe" in data:
+                try: sock.sendto(msg, src)
+                except: pass
+        except socket.timeout:
+            pass
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     ssl_kwargs = {}

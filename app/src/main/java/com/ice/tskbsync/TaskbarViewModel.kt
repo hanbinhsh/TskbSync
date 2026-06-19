@@ -1,6 +1,7 @@
 package com.ice.tskbsync
 
 import android.app.Application
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -42,6 +43,8 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.SecureRandom
@@ -53,6 +56,8 @@ import javax.net.ssl.X509TrustManager
 import kotlin.math.roundToLong
 
 data class DiscoveredServer(val ip: String, val name: String)
+
+enum class ConnectionState { DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING }
 
 data class H264VideoConfig(val width: Int, val height: Int, val fps: Int = 60)
 
@@ -124,6 +129,9 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _isConnected = mutableStateOf(false)
     val isConnected: State<Boolean> = _isConnected
 
+    private val _connectionState = mutableStateOf(ConnectionState.DISCONNECTED)
+    val connectionState: State<ConnectionState> = _connectionState
+
     private val _error = mutableStateOf<String?>(null)
     val error: State<String?> = _error
 
@@ -139,7 +147,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private fun wsBase(ip: String) = "${if (_useEncryption.value) "wss" else "ws"}://$ip:8000"
     private fun httpBase(ip: String) = "${if (_useEncryption.value) "https" else "http"}://$ip:8000"
 
-    private val _theme = mutableStateOf(ThemeSettings(0xFF6200EE.toInt(), "", true, 0.5f, 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0.7f, 0, 0f, 0.85f, false, false, 720, 72, 30, false, false, false, 0, 60, true, true, 0xFF202124.toInt(), 0.87f, 56, true, 2000, false, 18, true, true, true, true, false, 1.8f))
+    private val _theme = mutableStateOf(ThemeSettings.DEFAULT)
     val theme: State<ThemeSettings> = _theme
 
     private val _layoutMode = mutableStateOf("grid")
@@ -185,8 +193,13 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
     private val _inputStatus = mutableStateOf<String?>(null)
     val inputStatus: State<String?> = _inputStatus
 
-    private var inputWsSession: DefaultClientWebSocketSession? = null
+    @Volatile private var inputWsSession: DefaultClientWebSocketSession? = null
     private var remoteInputTarget: String? = null
+    // The input target the user is currently controlling, so a dropped input
+    // socket can transparently reconnect instead of getting stuck "not connected".
+    private var desiredInputWindow: Long? = null
+    private var desiredInputScreen: Int? = null
+    private var lastInputReconnectAt = 0L
     private var lastMultiTouchSentAt = 0L
     private var pendingMultiTouchPoints: List<TouchPointInput>? = null
     private var pendingMultiTouchJob: Job? = null
@@ -254,16 +267,21 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         val pass = _password.value
         connectionJob = viewModelScope.launch {
             var reconnectDelay = reconnectBaseDelayMs
+            var firstAttempt = true
             while (isActive) {
+                _connectionState.value = if (firstAttempt) ConnectionState.CONNECTING else ConnectionState.RECONNECTING
                 try {
-                    applyBackendStreamConfig(_theme.value, ip)
-                    applyGridPreviewConfig(_theme.value, ip)
-                    applyWindowFilterConfig(_windowFilter.value, ip)
+                    // Push backend config concurrently so it doesn't delay opening the
+                    // window-list socket (the live endpoints also read params from the URL).
+                    launch { applyBackendStreamConfig(_theme.value, ip) }
+                    launch { applyGridPreviewConfig(_theme.value, ip) }
+                    launch { applyWindowFilterConfig(_windowFilter.value, ip) }
                     client.webSocket("${wsBase(ip)}/ws") {
                         activeWsSession = this
                         send(Frame.Text(pass))
                         send(Frame.Text(if (wantsGridPreviews) "grid_preview:1" else "grid_preview:0"))
                         _isConnected.value = true
+                        _connectionState.value = ConnectionState.CONNECTED
                         _error.value = null
                         reconnectDelay = reconnectBaseDelayMs
                         TaskbarWidgetProvider.updateAll(getApplication())
@@ -284,6 +302,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                                         "list" -> {
                                             val list = Json.decodeFromJsonElement<List<WindowInfo>>(json["data"]!!)
                                             _windows.value = list
+                                            pruneGridPreviewCache(list)
                                             _lastSyncTime.value = System.currentTimeMillis()
                                         }
                                         "grid_previews" -> {
@@ -310,10 +329,21 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 }
 
                 if (!isActive) break
+                _connectionState.value = ConnectionState.RECONNECTING
+                firstAttempt = false
                 delay(reconnectDelay)
                 reconnectDelay = (reconnectDelay * 2).coerceAtMost(reconnectMaxDelayMs)
             }
+            _connectionState.value = ConnectionState.DISCONNECTED
         }
+    }
+
+    // Keep the preview cache bounded: drop entries for windows that no longer exist.
+    private fun pruneGridPreviewCache(windows: List<WindowInfo>) {
+        if (gridPreviewCache.isEmpty()) return
+        val valid = windows.mapTo(HashSet()) { it.hwnd }
+        val stale = gridPreviewCache.keys.filter { it !in valid }
+        stale.forEach { gridPreviewCache.remove(it) }
     }
 
     fun startLiveStream(hwnd: Long) {
@@ -330,7 +360,9 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         liveStreamJob = viewModelScope.launch {
             try {
                 val streamSettings = _theme.value
-                applyBackendStreamConfig(streamSettings, ip)
+                // Apply config in parallel; the live endpoint also reads params from the URL,
+                // so we don't need to wait for this round-trip before opening the stream.
+                launch { applyBackendStreamConfig(streamSettings, ip) }
                 val livePath = if (streamSettings.useHighPerformanceWindowStreaming) "live_h264" else "live"
                 val liveUrl = "${wsBase(ip)}/$livePath/$hwnd" +
                     "?max_dim=${streamSettings.streamMaxDim}" +
@@ -659,6 +691,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         val ip = _pcIp.value
         val pass = _password.value
         if (ip.isEmpty() || hwnd == 0L) return
+        desiredInputWindow = hwnd
+        desiredInputScreen = null
         inputJob = viewModelScope.launch {
             try {
                 client.webSocket("${wsBase(ip)}/input/$hwnd") {
@@ -698,6 +732,8 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         val ip = _pcIp.value
         val pass = _password.value
         if (ip.isEmpty() || monitorIndex <= 0) return
+        desiredInputScreen = monitorIndex
+        desiredInputWindow = null
         inputJob = viewModelScope.launch {
             try {
                 client.webSocket("${wsBase(ip)}/input/screen/$monitorIndex") {
@@ -739,9 +775,22 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         inputJob?.cancel()
         inputWsSession = null
         remoteInputTarget = null
+        desiredInputWindow = null
+        desiredInputScreen = null
         pendingMultiTouchJob?.cancel()
         pendingMultiTouchJob = null
         pendingMultiTouchPoints = null
+    }
+
+    /** Re-establish the input socket if it dropped but the user is still
+     *  controlling a target. Debounced so high-frequency input can't spam it. */
+    private fun ensureInputConnected() {
+        if (inputJob?.isActive == true) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastInputReconnectAt < 600L) return
+        lastInputReconnectAt = now
+        desiredInputScreen?.let { startRemoteScreenInput(it); return }
+        desiredInputWindow?.let { startRemoteInput(it) }
     }
 
     fun clearInputStatus() {
@@ -758,13 +807,21 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
             try {
                 val session = inputWsSession
                 if (session == null) {
-                    _inputStatus.value = "Input not connected"
+                    // Socket dropped (or not up yet): heal it instead of getting stuck.
+                    ensureInputConnected()
+                    if (desiredInputWindow != null || desiredInputScreen != null) {
+                        _inputStatus.value = "Reconnecting input…"
+                    } else {
+                        _inputStatus.value = "Input not connected"
+                    }
                     return@launch
                 }
                 session.send(Frame.Text(payload.toString()))
             } catch (e: Exception) {
                 Log.e("TaskbarInput", "Send input failed", e)
-                _inputStatus.value = "Input send failed: ${e.message ?: e::class.java.simpleName}"
+                inputWsSession = null
+                ensureInputConnected()
+                _inputStatus.value = "Reconnecting input…"
             }
         }
     }
@@ -1084,7 +1141,7 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         liveStreamJob = viewModelScope.launch {
             try {
                 val streamSettings = _theme.value
-                applyBackendStreamConfig(streamSettings, ip)
+                launch { applyBackendStreamConfig(streamSettings, ip) }
                 val useScreenHardware = streamSettings.useHardwareEncoding
                 val livePath = if (useScreenHardware) "live_h264/screen" else "live/screen"
                 val liveUrl = "${wsBase(ip)}/$livePath/$monitorIndex" +
@@ -1317,25 +1374,52 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
         discoveredServers.clear()
         viewModelScope.launch(Dispatchers.IO) {
             var socket: DatagramSocket? = null
+            // A multicast lock improves reception of broadcast packets on some devices.
+            val multicastLock = runCatching {
+                val wifi = getApplication<Application>().getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+                wifi.createMulticastLock("tskbsync-discovery").apply { setReferenceCounted(false); acquire() }
+            }.getOrNull()
             try {
-                socket = DatagramSocket(8001); socket.soTimeout = 2500
-                val buffer = ByteArray(1024); val startTime = System.currentTimeMillis()
-                while (System.currentTimeMillis() - startTime < 3000) {
+                socket = DatagramSocket(null).apply {
+                    reuseAddress = true
+                    broadcast = true
+                    bind(InetSocketAddress(8001))
+                    soTimeout = 700
+                }
+                val probe = "tskb_probe".toByteArray()
+                val broadcast = InetAddress.getByName("255.255.255.255")
+                val buffer = ByteArray(2048)
+                val startTime = System.currentTimeMillis()
+                var lastProbe = 0L
+                // Actively probe (server replies by unicast) and also listen for the
+                // server's periodic broadcasts, for ~4s.
+                while (System.currentTimeMillis() - startTime < 4000) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastProbe >= 1000) {
+                        runCatching { socket.send(DatagramPacket(probe, probe.size, broadcast, 8001)) }
+                        lastProbe = now
+                    }
                     val packet = DatagramPacket(buffer, buffer.size)
                     try {
                         socket.receive(packet)
+                        val payload = String(packet.data, 0, packet.length)
+                        if (!payload.contains("tskb_sync")) continue   // ignore our own probe echoes
                         val senderIp = packet.address.hostAddress ?: continue
                         val hostname = runCatching {
-                            val obj = Json.parseToJsonElement(String(packet.data, 0, packet.length)).jsonObject
-                            obj["hostname"]?.jsonPrimitive?.contentOrNull
+                            Json.parseToJsonElement(payload).jsonObject["hostname"]?.jsonPrimitive?.contentOrNull
                         }.getOrNull()?.takeIf { it.isNotBlank() } ?: senderIp
                         if (discoveredServers.none { it.ip == senderIp }) {
                             discoveredServers.add(DiscoveredServer(senderIp, hostname))
                         }
                     } catch (e: Exception) { }
                 }
-            } catch (e: Exception) { }
-            finally { socket?.close(); isDiscovering = false }
+            } catch (e: Exception) {
+                Log.w("TaskbarViewModel", "Discovery failed", e)
+            } finally {
+                socket?.close()
+                runCatching { multicastLock?.release() }
+                isDiscovering = false
+            }
         }
     }
 
