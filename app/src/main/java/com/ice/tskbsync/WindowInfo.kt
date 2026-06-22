@@ -56,7 +56,8 @@ data class ExtendedDisplayStatus(
     val monitor_index: Int = 0,
     val screen: ScreenInfo? = null,
     val current_mode: ExtendedDisplayMode? = null,
-    val supported_modes: List<ExtendedDisplayMode> = emptyList()
+    val supported_modes: List<ExtendedDisplayMode> = emptyList(),
+    val mode_monitor_index: Int = 0
 )
 
 @Serializable

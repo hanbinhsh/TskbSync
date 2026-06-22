@@ -22,6 +22,7 @@ import io.ktor.client.plugins.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.websocket.*
 import io.ktor.client.request.*
+import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.*
 import io.ktor.serialization.kotlinx.json.*
@@ -1272,6 +1273,42 @@ class TaskbarViewModel(application: Application) : AndroidViewModel(application)
                 fetchExtendedDisplayStatus()
             } finally {
                 _extendedDisplayConnecting.value = false
+            }
+        }
+    }
+
+    fun setVirtualDisplayMode(monitorIndex: Int, width: Int, height: Int, fps: Int) {
+        val ip = _pcIp.value
+        if (ip.isEmpty() || width <= 0 || height <= 0) return
+        viewModelScope.launch {
+            try {
+                val resp = client.post("${httpBase(ip)}/extended_display/set_mode") {
+                    header("password", _password.value)
+                    contentType(ContentType.Application.Json)
+                    timeout { requestTimeoutMillis = 15000 }
+                    setBody(buildJsonObject {
+                        put("monitor_index", monitorIndex)
+                        put("width", width)
+                        put("height", height)
+                        put("fps", fps)
+                    }.toString())
+                }
+                if (resp.status.isSuccess()) {
+                    val status: ExtendedDisplayStatus = resp.body()
+                    _extendedDisplayStatus.value = status
+                    _inputStatus.value = status.message.ifBlank { "Resolution updated" }
+                    fetchScreens()
+                } else {
+                    val msg = runCatching {
+                        resp.body<JsonObject>()["message"]?.jsonPrimitive?.content
+                    }.getOrNull()
+                    _inputStatus.value = "Resolution change failed: ${msg ?: resp.status}"
+                    fetchExtendedDisplayStatus()
+                }
+            } catch (e: Exception) {
+                Log.e("TaskbarViewModel", "Set virtual display mode failed", e)
+                _inputStatus.value = "Resolution change failed: ${e.localizedMessage}"
+                fetchExtendedDisplayStatus()
             }
         }
     }

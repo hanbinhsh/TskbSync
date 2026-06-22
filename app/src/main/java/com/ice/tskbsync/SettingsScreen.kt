@@ -351,6 +351,46 @@ fun SettingsScreen(viewModel: TaskbarViewModel, navController: NavController) {
                                     onCheckedChange = { viewModel.setExtendedDisplayDriverEnabled(it) }
                                 )
                             }
+                            val vd = extendedDisplayStatus
+                            if (vd?.available == true && vd.supported_modes.isNotEmpty()) {
+                                SettingsSection("Resolution") {
+                                    val fmt: (ExtendedDisplayMode) -> String = { m ->
+                                        "${m.width} × ${m.height}" + if (m.fps > 0) "  @${m.fps}Hz" else ""
+                                    }
+                                    val targetIndex = vd.mode_monitor_index.takeIf { it > 0 } ?: vd.monitor_index
+                                    var expanded by remember { mutableStateOf(false) }
+                                    Box {
+                                        OutlinedTextField(
+                                            value = vd.current_mode?.let(fmt) ?: "Unknown",
+                                            onValueChange = {},
+                                            readOnly = true,
+                                            label = { Text("Resolution / Refresh Rate") },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            trailingIcon = {
+                                                IconButton(onClick = { expanded = true }) {
+                                                    Icon(Icons.Default.ArrowDropDown, null)
+                                                }
+                                            }
+                                        )
+                                        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                                            vd.supported_modes.forEach { mode ->
+                                                DropdownMenuItem(
+                                                    text = { Text(fmt(mode)) },
+                                                    onClick = {
+                                                        expanded = false
+                                                        viewModel.setVirtualDisplayMode(targetIndex, mode.width, mode.height, mode.fps)
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    }
+                                    Text(
+                                        "Applies to the active virtual monitor. Custom resolutions beyond this list require editing the virtual display driver's own config.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
                         }
 
                         7 -> item {
